@@ -9,7 +9,6 @@ if (!file_exists($configPath)) {
 require_once $configPath;
 require_once __DIR__ . '/../includes/auth.php';
 
-// Roles allowed to manage schedules. Keep this in sync with schedule.php.
 $manageRoles = ['admin', 'super_admin', 'teacher'];
 
 if (!isLoggedIn() || !in_array(currentUser()['role'], $manageRoles)) {
@@ -24,13 +23,16 @@ if (!$id) {
     exit;
 }
 
-// Fetch schedule data (teacher_name comes from the class's assigned teacher)
+// Fetch schedule data — use COALESCE so user-linked and standalone
+// teacher records both resolve to a name.
 $stmt = $pdo->prepare("
-    SELECT s.*, c.class_id, c.section, sub.subject_name, sub.course_code, t.name as teacher_name
+    SELECT s.*, c.class_id, c.section, sub.subject_name, sub.course_code,
+           COALESCE(u.full_name, t.name) AS teacher_name
     FROM schedules s
-    JOIN classes c ON s.class_id = c.class_id
+    JOIN classes c     ON s.class_id    = c.class_id
     LEFT JOIN subjects sub ON c.course_code = sub.course_code
-    LEFT JOIN teachers t ON c.teacher_id = t.id
+    LEFT JOIN teachers t   ON c.teacher_id  = t.id
+    LEFT JOIN users    u   ON t.user_id      = u.id
     WHERE s.schedule_id = ?
 ");
 $stmt->execute([$id]);
@@ -40,14 +42,15 @@ if (!$schedule) {
     exit;
 }
 
-// All classes for dropdown
+// All classes for dropdown — also use COALESCE here
 $classes = $pdo->query("
     SELECT c.class_id, c.section, c.course_code,
            COALESCE(sub.subject_name, 'Unknown Subject') AS subject_name,
-           COALESCE(t.name, 'Not assigned') AS teacher_name
+           COALESCE(u.full_name, t.name, 'Not assigned') AS teacher_name
     FROM classes c
     LEFT JOIN subjects sub ON c.course_code = sub.course_code
-    LEFT JOIN teachers t ON c.teacher_id = t.id
+    LEFT JOIN teachers t   ON c.teacher_id  = t.id
+    LEFT JOIN users    u   ON t.user_id      = u.id
     ORDER BY sub.subject_name, c.section
 ")->fetchAll();
 
@@ -83,48 +86,50 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             try {
                 $pdo->beginTransaction();
 
-                // Subject of the selected class (used as the teacher's subject if created)
-                $subLookup = $pdo->prepare("
-                    SELECT COALESCE(sub.subject_name, '') AS subject_name
-                    FROM classes c
-                    LEFT JOIN subjects sub ON c.course_code = sub.course_code
-                    WHERE c.class_id = ?
+                // Look up the teacher by name (checking both t.name and u.full_name)
+                $tq = $pdo->prepare("
+                    SELECT t.id FROM teachers t
+                    LEFT JOIN users u ON t.user_id = u.id
+                    WHERE LOWER(COALESCE(u.full_name, t.name)) = LOWER(?)
+                    LIMIT 1
                 ");
-                $subLookup->execute([$class_id]);
-                $subjName = $subLookup->fetchColumn() ?: '';
-
-                // Find or create the teacher (by name). Inserts only name + subject;
-                // assumes the other teacher columns are nullable / defaulted. If your
-                // schema is stricter you'll get a "Database error" below.
-                $tq = $pdo->prepare("SELECT id FROM teachers WHERE LOWER(name) = LOWER(?) LIMIT 1");
                 $tq->execute([$teacher_name]);
                 $trow = $tq->fetch();
+
                 if ($trow) {
                     $teacher_id = $trow['id'];
                 } else {
+                    // New teacher name not in DB — get subject name for the record
+                    $subLookup = $pdo->prepare("
+                        SELECT COALESCE(sub.subject_name, '') AS subject_name
+                        FROM classes c
+                        LEFT JOIN subjects sub ON c.course_code = sub.course_code
+                        WHERE c.class_id = ?
+                    ");
+                    $subLookup->execute([$class_id]);
+                    $subjName = $subLookup->fetchColumn() ?: '';
+
                     $pdo->prepare("INSERT INTO teachers (name, subject) VALUES (?, ?)")
                         ->execute([$teacher_name, $subjName]);
                     $teacher_id = $pdo->lastInsertId();
                 }
 
-                // Assign that teacher to the selected class
+                // Assign the teacher to the selected class
                 $pdo->prepare("UPDATE classes SET teacher_id = ? WHERE class_id = ?")
                     ->execute([$teacher_id, $class_id]);
 
-                // Update the schedule
+                // Update the schedule itself
                 $pdo->prepare("UPDATE schedules SET class_id = ?, day = ?, start_time = ?, end_time = ?, room = ? WHERE schedule_id = ?")
                     ->execute([$class_id, $day, $start_time, $end_time, $room, $id]);
 
                 $pdo->commit();
                 $success = 'Schedule updated successfully!';
 
-                // Refresh data so the form shows the saved values (incl. new teacher)
+                // Refresh so the form shows saved values
                 $stmt->execute([$id]);
                 $schedule = $stmt->fetch();
             } catch (PDOException $e) {
-                if ($pdo->inTransaction()) {
-                    $pdo->rollBack();
-                }
+                if ($pdo->inTransaction()) $pdo->rollBack();
                 $error = 'Database error: ' . $e->getMessage();
             }
         }

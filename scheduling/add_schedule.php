@@ -163,7 +163,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                     </div>
                     <div class="f full">
                         <label>Teacher Name *</label>
-                        <input type="text" name="teacher_name" required placeholder="e.g. Juan Dela Cruz" value="<?= htmlspecialchars($_POST['teacher_name'] ?? '') ?>">
+                        <input type="text" name="teacher_name" required placeholder="e.g. Alpas, C" value="<?= htmlspecialchars($_POST['teacher_name'] ?? '') ?>">
                     </div>
                     <div class="f">
                         <label>Day *</label>

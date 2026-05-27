@@ -13,8 +13,6 @@ if (!isLoggedIn()) {
 
 $pdo = db();
 
-// Roles allowed to manage (add/edit/delete) schedules.
-// Adjust this list if your role values differ.
 $manageRoles = ['admin', 'super_admin', 'teacher'];
 $canManage   = in_array(currentUser()['role'], $manageRoles);
 
@@ -27,16 +25,18 @@ if ($delete_id && $canManage) {
     $success = "Schedule deleted.";
 }
 
-// Query schedules with class, subject, teacher details
+// Query schedules — use COALESCE(u.full_name, t.name) so both user-linked
+// and standalone teacher records resolve to a display name.
 $sql = "
-    SELECT s.*, 
+    SELECT s.*,
            c.class_id, c.section,
            sub.subject_name, sub.course_code,
-           t.name as teacher_name
+           COALESCE(u.full_name, t.name, 'Not assigned') AS teacher_name
     FROM schedules s
     JOIN classes c ON s.class_id = c.class_id
     LEFT JOIN subjects sub ON c.course_code = sub.course_code
-    LEFT JOIN teachers t ON c.teacher_id = t.id
+    LEFT JOIN teachers t   ON c.teacher_id  = t.id
+    LEFT JOIN users    u   ON t.user_id      = u.id
     WHERE 1=1
 ";
 $params = [];
@@ -108,7 +108,7 @@ $daysOrder = ['Monday','Tuesday','Wednesday','Thursday','Friday','Saturday'];
                         <tr>
                             <td><strong><?= htmlspecialchars($s['subject_name'] ?? 'No Subject') ?></strong><br><small><?= htmlspecialchars($s['course_code'] ?? '') ?></small></td>
                             <td><?= htmlspecialchars($s['section']) ?></td>
-                            <td><?= htmlspecialchars($s['teacher_name'] ?? 'Not assigned') ?></td>
+                            <td><?= htmlspecialchars($s['teacher_name']) ?></td>
                             <td><span class="badge b-<?= strtolower($day) ?>"><?= $day ?></span></td>
                             <td><?= date('h:i A', strtotime($s['start_time'])) ?> – <?= date('h:i A', strtotime($s['end_time'])) ?></td>
                             <td><?= htmlspecialchars($s['room']) ?></td>
