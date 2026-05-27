@@ -3,7 +3,7 @@
 -- https://www.phpmyadmin.net/
 --
 -- Host: 127.0.0.1
--- Generation Time: May 25, 2026 at 03:50 AM
+-- Generation Time: May 27, 2026 at 08:50 AM
 -- Server version: 10.4.32-MariaDB
 -- PHP Version: 8.2.12
 
@@ -103,11 +103,12 @@ CREATE TABLE `classes` (
 --
 
 INSERT INTO `classes` (`class_id`, `class_code`, `course_code`, `section`, `teacher_id`, `time_in`, `grace_period_minutes`) VALUES
-(1, 'A4', 'IT11', 'BSIT 1A', 16, NULL, 15),
-(2, 'A37', 'ITC15', 'BSIT 2B', 16, NULL, 15),
-(3, 'A28', 'ELECIT103', 'BSIT 2A', 17, NULL, 15),
-(4, 'A30', 'IT16', 'BSIT 2A', 18, NULL, 15),
-(5, 'A51', 'IT22', 'BSIT 3A', 17, NULL, 15);
+(1, 'A4', 'IT11', 'BSIT 1A', 1, NULL, 15),
+(2, 'A37', 'ITC15', 'BSIT 2B', 1, NULL, 15),
+(3, 'A28', 'ELECIT103', 'BSIT 2A', 2, NULL, 15),
+(4, 'A30', 'IT16', 'BSIT 2A', 3, NULL, 15),
+(5, 'A51', 'IT22', 'BSIT 3A', 2, NULL, 15),
+(6, NULL, 'ITC16', 'BSIT-3A', 2, NULL, 15);
 
 -- --------------------------------------------------------
 
@@ -225,7 +226,8 @@ INSERT INTO `parents` (`parent_id`, `student_id`, `parent_name`, `contact_number
 (60, 60, '', '09508760485', 'Guardian'),
 (61, 61, '', '09508760485', 'Guardian'),
 (62, 62, '', '09508760485', 'Guardian'),
-(63, 63, '', '09508760485', 'Guardian');
+(63, 63, '', '09508760485', 'Guardian'),
+(64, 64, 'JohnLloyd Momo', '09947846234', NULL);
 
 -- --------------------------------------------------------
 
@@ -253,7 +255,8 @@ INSERT INTO `schedules` (`schedule_id`, `class_id`, `day`, `start_time`, `end_ti
 (9, 5, 'Monday', '10:30:00', '12:00:00', 'COM LAB A', 1),
 (10, 3, 'Monday', '13:00:00', '14:30:00', 'COM LAB A', 1),
 (11, 3, 'Monday', '14:30:00', '16:30:00', 'COM LAB A', 1),
-(12, 4, 'Monday', '17:00:00', '18:30:00', 'COM LAB A', 1);
+(12, 4, 'Monday', '17:00:00', '18:30:00', 'COM LAB A', 1),
+(14, 6, 'Tuesday', '08:00:00', '11:30:00', 'COM LAB A', 1);
 
 -- --------------------------------------------------------
 
@@ -341,7 +344,8 @@ INSERT INTO `students` (`id`, `user_id`, `student_number`, `full_name`, `gender`
 (60, NULL, 'B20230185', 'Sebala, Jason R.', 'M', 'BSIT', 1, 'BSIT 1A', '09396143600', NULL, '2026-05-21 07:41:43'),
 (61, NULL, '20250588', 'Sian, Lilian Paula Marie T.', 'F', 'BSIT', 1, 'BSIT 1A', '09167393236', NULL, '2026-05-21 07:41:43'),
 (62, NULL, '20250497', 'Tamon, John Jacob B.', 'M', 'BSIT', 1, 'BSIT 1A', '09561665575', NULL, '2026-05-21 07:41:43'),
-(63, NULL, '20250798', 'Villanueva, Junila Althea H.', 'F', 'BSIT', 1, 'BSIT 1A', '09052417483', NULL, '2026-05-21 07:41:43');
+(63, NULL, '20250798', 'Villanueva, Junila Althea H.', 'F', 'BSIT', 1, 'BSIT 1A', '09052417483', NULL, '2026-05-21 07:41:43'),
+(64, NULL, '20230333', 'Kurt Adrian T. Mujal', 'M', 'BSIT', 3, NULL, '09947846234', 'kurtadrian.mujal.s@southlandcollege.edu.ph', '2026-05-27 06:23:03');
 
 -- --------------------------------------------------------
 
@@ -445,7 +449,8 @@ INSERT INTO `student_schedule` (`id`, `student_id`, `schedule_id`, `class_id`, `
 (114, 46, 12, 4, '2026-04-14 07:42:37'),
 (115, 47, 12, 4, '2026-04-14 07:42:37'),
 (116, 48, 12, 4, '2026-04-14 07:42:37'),
-(117, 49, 12, 4, '2026-04-14 07:42:37');
+(117, 49, 12, 4, '2026-04-14 07:42:37'),
+(118, 64, 14, 6, '2026-05-27 06:23:03');
 
 -- --------------------------------------------------------
 
@@ -499,12 +504,9 @@ CREATE TABLE `teachers` (
 --
 
 INSERT INTO `teachers` (`id`, `user_id`, `name`, `subject`, `email`, `teacher_number`, `department`, `contact`, `profile_picture`, `bio`, `age`, `address`) VALUES
-(13, NULL, 'Andico, LJ', 'SIA', 'lj@gmail.com', NULL, NULL, '09347375393', '', 'Ex lover ni tagulalac', 542, 'Ilog'),
-(14, NULL, 'Tagulalac, D', NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL),
-(15, NULL, 'Alpas, C', NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL),
-(16, 5, NULL, NULL, NULL, 'TCH-2024-013', 'Information Technology', NULL, NULL, NULL, NULL, NULL),
-(17, 6, NULL, NULL, NULL, 'TCH-2024-014', 'Information Technology', NULL, NULL, NULL, NULL, NULL),
-(18, 7, NULL, NULL, NULL, 'TCH-2024-015', 'Information Technology', NULL, NULL, NULL, NULL, NULL);
+(1, 5, 'Andico, LJ', 'Information Management 1 / Introduction to Human Computer Interaction', NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL),
+(2, 6, 'Tagulalac, D', 'Fundamentals of Database Systems / Information Assurance & Security 1', NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL),
+(3, 7, 'Alpas, C', 'Quantitative Methods', NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL);
 
 -- --------------------------------------------------------
 
@@ -518,17 +520,6 @@ CREATE TABLE `teacher_subjects` (
   `course_code` varchar(20) NOT NULL,
   `section` varchar(20) DEFAULT NULL
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci;
-
---
--- Dumping data for table `teacher_subjects`
---
-
-INSERT INTO `teacher_subjects` (`id`, `teacher_id`, `course_code`, `section`) VALUES
-(26, 16, 'IT11', 'BSIT 1A'),
-(27, 16, 'ITC15', 'BSIT 2B'),
-(28, 17, 'ELECIT103', 'BSIT 2A'),
-(29, 17, 'IT22', 'BSIT 3A'),
-(30, 18, 'IT16', 'BSIT 2A');
 
 -- --------------------------------------------------------
 
@@ -553,8 +544,8 @@ CREATE TABLE `users` (
 --
 
 INSERT INTO `users` (`id`, `username`, `password_hash`, `full_name`, `email`, `role`, `status`, `last_login`, `created_at`) VALUES
-(1, 'admin', '$2y$10$bkLDCZYCWzWvHB6PWdC0d.W8jwtFhhcME.gzlPYs4IMaTw3v.lDcm', 'System Administrator', 'admin@sams.edu', 'super_admin', 'active', '2026-05-25 02:29:11', '2026-05-20 16:12:15'),
-(2, 'lorie', '$2y$10$LKMfZ/ozy98MPxuDgC8g4ez22Gv2OJZIBrmAyXcAjoQT7chdFnRDW', 'Teacher Lorie', 'lorie@sams.edu', 'teacher', 'active', '2026-05-25 02:15:47', '2026-05-20 16:12:15'),
+(1, 'admin', '$2y$10$bkLDCZYCWzWvHB6PWdC0d.W8jwtFhhcME.gzlPYs4IMaTw3v.lDcm', 'System Administrator', 'admin@sams.edu', 'super_admin', 'active', '2026-05-27 06:43:08', '2026-05-20 16:12:15'),
+(2, 'lorie', '$2y$10$LKMfZ/ozy98MPxuDgC8g4ez22Gv2OJZIBrmAyXcAjoQT7chdFnRDW', 'Teacher Lorie', 'lorie@sams.edu', 'teacher', 'active', '2026-05-27 05:05:48', '2026-05-20 16:12:15'),
 (3, 'dan', '$2y$10$LKMfZ/ozy98MPxuDgC8g4ez22Gv2OJZIBrmAyXcAjoQT7chdFnRDW', 'Sir Dan', 'dan@sams.edu', 'teacher', 'active', '2026-05-25 02:28:26', '2026-05-20 16:12:15'),
 (4, 'christine', '$2y$10$LKMfZ/ozy98MPxuDgC8g4ez22Gv2OJZIBrmAyXcAjoQT7chdFnRDW', 'Teacher Christine', 'christine@sams.edu', 'teacher', 'active', '2026-05-25 01:33:18', '2026-05-20 16:12:15'),
 (5, 'andico', '$2y$10$LKMfZ/ozy98MPxuDgC8g4ez22Gv2OJZIBrmAyXcAjoQT7chdFnRDW', 'Andico, LJ', NULL, 'teacher', 'active', NULL, '2026-05-21 07:41:43'),
@@ -770,7 +761,7 @@ ALTER TABLE `attendance_logs`
 -- AUTO_INCREMENT for table `classes`
 --
 ALTER TABLE `classes`
-  MODIFY `class_id` int(11) NOT NULL AUTO_INCREMENT, AUTO_INCREMENT=6;
+  MODIFY `class_id` int(11) NOT NULL AUTO_INCREMENT, AUTO_INCREMENT=7;
 
 --
 -- AUTO_INCREMENT for table `dispute_requests`
@@ -788,31 +779,31 @@ ALTER TABLE `message_history`
 -- AUTO_INCREMENT for table `parents`
 --
 ALTER TABLE `parents`
-  MODIFY `parent_id` int(11) NOT NULL AUTO_INCREMENT, AUTO_INCREMENT=64;
+  MODIFY `parent_id` int(11) NOT NULL AUTO_INCREMENT, AUTO_INCREMENT=65;
 
 --
 -- AUTO_INCREMENT for table `schedules`
 --
 ALTER TABLE `schedules`
-  MODIFY `schedule_id` int(11) NOT NULL AUTO_INCREMENT, AUTO_INCREMENT=13;
+  MODIFY `schedule_id` int(11) NOT NULL AUTO_INCREMENT, AUTO_INCREMENT=15;
 
 --
 -- AUTO_INCREMENT for table `students`
 --
 ALTER TABLE `students`
-  MODIFY `id` int(11) NOT NULL AUTO_INCREMENT, AUTO_INCREMENT=64;
+  MODIFY `id` int(11) NOT NULL AUTO_INCREMENT, AUTO_INCREMENT=65;
 
 --
 -- AUTO_INCREMENT for table `student_schedule`
 --
 ALTER TABLE `student_schedule`
-  MODIFY `id` int(11) NOT NULL AUTO_INCREMENT, AUTO_INCREMENT=118;
+  MODIFY `id` int(11) NOT NULL AUTO_INCREMENT, AUTO_INCREMENT=119;
 
 --
 -- AUTO_INCREMENT for table `teachers`
 --
 ALTER TABLE `teachers`
-  MODIFY `id` int(11) NOT NULL AUTO_INCREMENT, AUTO_INCREMENT=19;
+  MODIFY `id` int(11) NOT NULL AUTO_INCREMENT, AUTO_INCREMENT=4;
 
 --
 -- AUTO_INCREMENT for table `teacher_subjects`
