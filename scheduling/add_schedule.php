@@ -105,8 +105,9 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 }
 
                 // 4. Insert the schedule.
-                $pdo->prepare("INSERT INTO schedules (class_id, day, start_time, end_time, room) VALUES (?, ?, ?, ?, ?)")
-                    ->execute([$class_id, $day, $start_time, $end_time, $room]);
+                // in_records = 1 makes this schedule visible in Profiles / Student Records
+                    $pdo->prepare("INSERT INTO schedules (class_id, day, start_time, end_time, room, in_records) VALUES (?, ?, ?, ?, ?, 1)")
+                        ->execute([$class_id, $day, $start_time, $end_time, $room]);
 
                 $pdo->commit();
                 $success = 'Schedule added successfully!';

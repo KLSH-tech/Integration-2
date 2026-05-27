@@ -192,7 +192,6 @@ $pdo = db();
                         <div class="p-3">
                             <div class="d-flex justify-content-between align-items-center mb-3">
                                 <h6 class="mb-0"><i class="bi bi-people"></i> Teachers</h6>
-                                <button class="btn btn-sm btn-primary" onclick="openAddTeacherModal()"><i class="bi bi-plus"></i> Add New</button>
                             </div>
                             <div id="teacherListSidebar"></div>
                         </div>
@@ -237,10 +236,15 @@ $pdo = db();
                     </div>
                 </form>
             </div>
-            <div class="modal-footer bg-light">
+            <div class="modal-footer bg-light d-flex justify-content-between w-100">
+                <button type="button" class="btn btn-danger" id="deleteTeacherBtn" onclick="deleteTeacher()" style="display:none!important;">
+                    <i class="bi bi-trash"></i> Delete Teacher
+                </button>
+            <div class="d-flex gap-2">
                 <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Cancel</button>
                 <button type="button" class="btn btn-primary" onclick="saveTeacher()">Save Teacher</button>
-            </div>
+        </div>
+</div>
         </div>
     </div>
 </div>
@@ -575,33 +579,59 @@ $pdo = db();
             });
     }
 
-    function openAddTeacherModal() {
+        function openAddTeacherModal() {
         document.getElementById('teacherFormTitle').innerText = 'Add New Teacher';
         document.getElementById('teacherForm').reset();
         document.getElementById('editTeacherId').value = '';
+        document.getElementById('deleteTeacherBtn').style.display = 'none';
         new bootstrap.Modal(document.getElementById('teacherFormModal')).show();
     }
 
     function editTeacherFromModal(id) {
-        fetch(`crud.php?action=get_teacher&id=${id}`)
+    fetch(`crud.php?action=get_teacher&id=${id}`)
+        .then(res => res.json())
+        .then(data => {
+            if (data.status === 'success') {
+                const t = data.data;
+                document.getElementById('teacherFormTitle').innerText = 'Edit Teacher';
+                document.getElementById('editTeacherId').value = t.id;
+                document.getElementById('teacherName').value = t.name;
+                document.getElementById('teacherSubject').value = t.subject;
+                document.getElementById('teacherNumber').value = t.teacher_number || '';
+                document.getElementById('teacherEmail').value = t.email || '';
+                document.getElementById('teacherContact').value = t.contact || '';
+                document.getElementById('teacherAge').value = t.age || '';
+                document.getElementById('teacherAddress').value = t.address || '';
+                document.getElementById('teacherBio').value = t.bio || '';
+                // Show delete button only when editing an existing teacher
+                document.getElementById('deleteTeacherBtn').style.display = 'inline-block';
+                new bootstrap.Modal(document.getElementById('teacherFormModal')).show();
+            } else showNotification(data.message, 'error');
+        });
+}
+
+        function deleteTeacher() {
+        const id = document.getElementById('editTeacherId').value;
+        if (!id) return;
+        if (!confirm('Are you sure you want to permanently delete this teacher? This cannot be undone.')) return;
+
+        const fd = new FormData();
+        fd.append('action', 'delete_teacher');
+        fd.append('id', id);
+
+        fetch('crud.php', { method: 'POST', body: fd })
             .then(res => res.json())
             .then(data => {
                 if (data.status === 'success') {
-                    const t = data.data;
-                    document.getElementById('teacherFormTitle').innerText = 'Edit Teacher';
-                    document.getElementById('editTeacherId').value = t.id;
-                    document.getElementById('teacherName').value = t.name;
-                    document.getElementById('teacherSubject').value = t.subject;
-                    document.getElementById('teacherNumber').value = t.teacher_number || '';
-                    document.getElementById('teacherEmail').value = t.email || '';
-                    document.getElementById('teacherContact').value = t.contact || '';
-                    document.getElementById('teacherAge').value = t.age || '';
-                    document.getElementById('teacherAddress').value = t.address || '';
-                    document.getElementById('teacherBio').value = t.bio || '';
-                    new bootstrap.Modal(document.getElementById('teacherFormModal')).show();
-                } else showNotification(data.message, 'error');
+                    showNotification('Teacher deleted successfully');
+                    bootstrap.Modal.getInstance(document.getElementById('teacherFormModal')).hide();
+                    // Refresh the teacher list sidebar
+                    loadTeacherListForSidebar();
+                } else {
+                    showNotification(data.message, 'error');
+                }
             });
-    }
+}
 
     function saveTeacher() {
         const form = document.getElementById('teacherForm');

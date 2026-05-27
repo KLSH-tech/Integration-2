@@ -36,28 +36,67 @@ if (in_array($action, $adminOnly) && !$isAdmin) {
 try {
     switch ($action) {
         // ========== STUDENT: get students grouped by subject ==========
+        // ========== READ: subjects for filter dropdown (code + name) ==========
+case 'get_subject_list':
+    // Only return subjects that have at least one active (in_records=1) schedule,
+    // so the filter always reflects what's actually scheduled.
+    $stmt = $pdo->query("
+        SELECT DISTINCT TRIM(sub.course_code) AS code, sub.subject_name AS name
+        FROM subjects sub
+        INNER JOIN classes c ON c.course_code = sub.course_code
+        INNER JOIN schedules sch ON sch.class_id = c.class_id
+        WHERE sch.in_records = 1
+          AND sub.course_code IS NOT NULL
+          AND TRIM(sub.course_code) <> ''
+        ORDER BY sub.subject_name
+    ");
+    echo json_encode($stmt->fetchAll(PDO::FETCH_ASSOC));
+    break;
+
+// ========== READ: classes + schedules (for add-student dropdown) ==========
+        case 'get_classes':
+            // Show all classes that have an active schedule (in_records=1).
+            // Removed the class_code != 'A28' guard — it was silently dropping
+            // newly added classes that have no class_code yet.
+            $stmt = $pdo->query("
+                SELECT c.class_id, sub.course_code AS subject_code, sub.subject_name, c.section,
+                    sch.schedule_id, sch.day,
+                    CONCAT(TIME_FORMAT(sch.start_time,'%l:%i %p'),' - ',TIME_FORMAT(sch.end_time,'%l:%i %p')) AS time,
+                    sch.room,
+                    COALESCE(u.full_name, t.name, 'Not assigned') AS instructor
+                FROM classes c
+                JOIN subjects sub ON c.course_code = sub.course_code
+                JOIN schedules sch ON sch.class_id = c.class_id AND sch.in_records = 1
+                LEFT JOIN teachers t ON c.teacher_id = t.id
+                LEFT JOIN users u ON t.user_id = u.id
+                ORDER BY sub.subject_name, sch.day
+            ");
+            echo json_encode($stmt->fetchAll());
+            break;
+
+// ========== STUDENT: get students grouped by subject ==========
         case 'get_students_by_subject':
             $subject_code = trim($_GET['subject'] ?? 'all');
             $search = trim($_GET['search'] ?? '');
             $day = $_GET['day'] ?? '';
 
             $sql = "SELECT s.id AS student_db_id, s.student_number AS student_id, s.full_name, s.gender,
-                           s.course, s.year_level, s.contact, s.email,
-                           p.parent_name, p.contact_number AS parent_contact,
-                           c.class_id, c.section, sub.course_code AS subject_code, sub.subject_name,
-                           sch.schedule_id, sch.day, 
-                           CONCAT(TIME_FORMAT(sch.start_time,'%l:%i %p'),' - ',TIME_FORMAT(sch.end_time,'%l:%i %p')) AS time,
-                           sch.room,
-                           COALESCE(u.full_name, 'Not assigned') AS instructor
-                    FROM student_schedule ss
-                    JOIN students s ON ss.student_id = s.id
-                    LEFT JOIN parents p ON p.student_id = s.id
-                    JOIN classes c ON ss.class_id = c.class_id
-                    JOIN subjects sub ON c.course_code = sub.course_code
-                    JOIN schedules sch ON ss.schedule_id = sch.schedule_id
-                    LEFT JOIN teachers t ON c.teacher_id = t.id
-                    LEFT JOIN users u ON t.user_id = u.id
-                    WHERE 1=1";
+                   s.course, s.year_level, s.contact, s.email,
+                   p.parent_name, p.contact_number AS parent_contact,
+                   c.class_id, c.section, sub.course_code AS subject_code, sub.subject_name,
+                   sch.schedule_id, sch.day,
+                   CONCAT(TIME_FORMAT(sch.start_time,'%l:%i %p'),' - ',TIME_FORMAT(sch.end_time,'%l:%i %p')) AS time,
+                   sch.room,
+                   COALESCE(u.full_name, t.name, 'Not assigned') AS instructor
+            FROM student_schedule ss
+            JOIN students s ON ss.student_id = s.id
+            LEFT JOIN parents p ON p.student_id = s.id
+            JOIN classes c ON ss.class_id = c.class_id
+            JOIN subjects sub ON c.course_code = sub.course_code
+            JOIN schedules sch ON ss.schedule_id = sch.schedule_id AND sch.in_records = 1
+            LEFT JOIN teachers t ON c.teacher_id = t.id
+            LEFT JOIN users u ON t.user_id = u.id
+            WHERE 1=1";
 
             $params = [];
             if ($subject_code !== 'all') {
@@ -83,40 +122,6 @@ try {
                 $grouped[$row['subject_name']][] = $row;
             }
             echo json_encode($grouped);
-            break;
-
-        // ========== READ: classes + schedules (for add‑student dropdown) ==========
-        case 'get_classes':
-            // NOTE: COALESCE so classes whose class_code is NULL (e.g. those created
-            // by add_schedule.php) are NOT silently excluded. `NULL != 'A28'` is not
-            // TRUE in SQL, which previously dropped every newly added class.
-            $stmt = $pdo->query("
-                SELECT c.class_id, sub.course_code AS subject_code, sub.subject_name, c.section,
-                       sch.schedule_id, sch.day, 
-                       CONCAT(TIME_FORMAT(sch.start_time,'%l:%i %p'),' - ',TIME_FORMAT(sch.end_time,'%l:%i %p')) AS time,
-                       sch.room, u.full_name AS instructor
-                FROM classes c
-                JOIN subjects sub ON c.course_code = sub.course_code
-                JOIN schedules sch ON sch.class_id = c.class_id
-                LEFT JOIN teachers t ON c.teacher_id = t.id
-                LEFT JOIN users u ON t.user_id = u.id
-                WHERE COALESCE(c.class_code, '') != 'A28'
-                ORDER BY sub.subject_name, sch.day
-            ");
-            echo json_encode($stmt->fetchAll());
-            break;
-
-        // ========== READ: subjects for filter dropdown (code + name) ==========
-        case 'get_subject_list':
-            // Returns objects { code, name } so the filter can DISPLAY the subject
-            // name while still FILTERING by course_code.
-            $stmt = $pdo->query("
-                SELECT DISTINCT TRIM(course_code) AS code, subject_name AS name
-                FROM subjects
-                WHERE course_code IS NOT NULL AND TRIM(course_code) <> ''
-                ORDER BY subject_name
-            ");
-            echo json_encode($stmt->fetchAll(PDO::FETCH_ASSOC));
             break;
 
         // ========== ADD student (admin only) ==========
