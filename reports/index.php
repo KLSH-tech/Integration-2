@@ -2,14 +2,12 @@
 require_once '../includes/auth.php';
 require_once '../includes/helpers.php';
 
-
-
-$db = db(); // must connect to student_attendance_system
+$db = db();
 
 $today      = date('Y-m-d');
 $lastMonday = date('N') == 1 ? $today : date('Y-m-d', strtotime('last monday'));
 
-// Helper functions
+// Helper functions (unchanged)
 function getYearFromLevel($level) {
     return (string)$level;
 }
@@ -35,61 +33,108 @@ function groupFlatByYear($rows, $levelKey = 'year_level') {
     return $grouped;
 }
 
-// ------------------- Monday stats -------------------
+// ------------------- Monday stats ---
+// SOURCE: attendance_logs (written by the barcode scanner)
+// Count only action='in' per student per class per day to avoid double-counting in/out pairs.
 $stats = $db->prepare("
     SELECT
-        COUNT(*) AS total,
-        SUM(status = 'Present') AS present,
-        SUM(status = 'Absent')  AS absent,
-        SUM(status = 'Late')    AS late
-    FROM attendance
-    WHERE date = ?
+        COUNT(*)                                          AS total,
+        SUM(attendance_status IN ('on_time','late'))      AS present,
+        SUM(attendance_status = 'absent')                 AS absent,
+        SUM(attendance_status = 'late')                   AS late
+    FROM (
+        SELECT student_id, class_id, attendance_status
+        FROM attendance_logs
+        WHERE DATE(logged_at) = ? AND action = 'in'
+        GROUP BY student_id, class_id
+    ) sub
 ");
 $stats->execute([$lastMonday]);
 $mondayStats = $stats->fetch(PDO::FETCH_ASSOC) ?: ['total'=>0,'present'=>0,'absent'=>0,'late'=>0];
 
-// Monday trend (last 4 Mondays)
+// Monday trend (last 4 Mondays) — from attendance_logs
 $trendQuery = $db->query("
     SELECT
-        date,
-        COUNT(*) AS total,
-        SUM(status = 'Present') AS present,
-        SUM(status = 'Absent')  AS absent,
-        SUM(status = 'Late')    AS late
-    FROM attendance
-    WHERE DAYOFWEEK(date) = 2
-    GROUP BY date
-    ORDER BY date DESC
+        DATE(logged_at)                                       AS date,
+        COUNT(*)                                              AS total,
+        SUM(attendance_status IN ('on_time','late'))          AS present,
+        SUM(attendance_status = 'absent')                     AS absent,
+        SUM(attendance_status = 'late')                       AS late
+    FROM (
+        SELECT student_id, class_id, attendance_status, logged_at
+        FROM attendance_logs
+        WHERE DAYOFWEEK(DATE(logged_at)) = 2 AND action = 'in'
+        GROUP BY student_id, class_id, DATE(logged_at)
+    ) sub
+    GROUP BY DATE(logged_at)
+    ORDER BY DATE(logged_at) DESC
     LIMIT 4
 ");
 $mondayTrend = $trendQuery->fetchAll(PDO::FETCH_ASSOC);
 $mondayTrend = array_reverse($mondayTrend);
 
-// ------------------- Subjects -------------------
-$subjects = $db->query("SELECT course_code, subject_name FROM subjects ORDER BY course_code")->fetchAll(PDO::FETCH_ASSOC);
+// ------------------- Subjects ---
+$subjects = $db->query("SELECT DISTINCT s.course_code, s.subject_name FROM subjects s INNER JOIN classes c ON c.course_code = s.course_code ORDER BY s.course_code")->fetchAll(PDO::FETCH_ASSOC);
 
-$hasClasses = false;
-$classInfo = [];
-try {
-    $classQuery = $db->query("SELECT class_id, course_code, section, year_level FROM classes");
-    $classInfo = $classQuery->fetchAll(PDO::FETCH_ASSOC);
-    $hasClasses = !empty($classInfo);
-} catch (PDOException $e) {}
+// ------------------- Classes with teacher + section (fully joined) ---
+// year_level comes from students table (via student_schedule) since classes has no year_level column
+$classRows = $db->query("
+    SELECT
+        c.class_id,
+        c.course_code,
+        c.section,
+        c.teacher_id,
+        COALESCE(t.name, 'Not assigned') AS teacher_name,
+        -- Derive year_level from the majority of enrolled students
+        (
+            SELECT s2.year_level
+            FROM student_schedule ss2
+            JOIN students s2 ON s2.id = ss2.student_id
+            WHERE ss2.class_id = c.class_id
+            GROUP BY s2.year_level
+            ORDER BY COUNT(*) DESC
+            LIMIT 1
+        ) AS year_level
+    FROM classes c
+    LEFT JOIN teachers t ON t.id = c.teacher_id
+")->fetchAll(PDO::FETCH_ASSOC);
 
+$hasClasses = !empty($classRows);
+
+// Build lookup maps
+$classInfoMap    = [];   // class_id  => row
+$courseClassMap  = [];   // course_code => first matching class row
+foreach ($classRows as $c) {
+    $classInfoMap[$c['class_id']] = $c;
+    if (!isset($courseClassMap[$c['course_code']])) {
+        $courseClassMap[$c['course_code']] = $c;
+    }
+}
+
+// classSubjectMap still needed by getStatusBreakdown
+$classSubjectMap = [];
+foreach ($classRows as $c) {
+    $classSubjectMap[$c['class_id']] = $c['course_code'];
+}
+
+// ------------------- Enrolled counts per class (from student_schedule) ---
+$enrolledMap = [];
+$enrollStmt = $db->query("SELECT class_id, COUNT(*) AS enrolled FROM student_schedule GROUP BY class_id");
+foreach ($enrollStmt->fetchAll(PDO::FETCH_ASSOC) as $row) {
+    $enrolledMap[$row['class_id']] = (int)$row['enrolled'];
+}
+
+// ------------------- Subjects enriched with class info ---
 $subjectsWithInfo = [];
 foreach ($subjects as $subj) {
     $code = $subj['course_code'];
-    $subj['section'] = '';
-    $subj['year_level'] = '0';
-    if ($hasClasses) {
-        $matches = array_filter($classInfo, fn($c) => $c['course_code'] == $code);
-        if (!empty($matches)) {
-            $first = reset($matches);
-            $subj['section'] = $first['section'] ?? '';
-            $subj['year_level'] = (string)($first['year_level'] ?? '0');
-        }
-    }
-    $subjectsWithInfo[] = $subj;
+    $match = $courseClassMap[$code] ?? null;
+    $subj['section']      = $match['section']      ?? 'N/A';
+    $subj['year_level']   = (string)($match['year_level'] ?? '0');
+    $subj['teacher_name'] = $match['teacher_name'] ?? 'Not assigned';
+    $subj['class_id']     = $match['class_id']     ?? null;
+    $subj['enrolled']     = $match ? ($enrolledMap[$match['class_id']] ?? 0) : 0;
+    $subjectsWithInfo[]   = $subj;
 }
 
 $groupedSubjects = [];
@@ -100,7 +145,7 @@ foreach ($subjectsWithInfo as $subj) {
 }
 ksort($groupedSubjects);
 
-// ------------------- Students -------------------
+// ------------------- Students ---
 $totalStudents = $db->query("SELECT COUNT(*) FROM students")->fetchColumn();
 
 $sectionCounts = $db->query("
@@ -111,34 +156,69 @@ $sectionCounts = $db->query("
     ORDER BY section
 ")->fetchAll(PDO::FETCH_ASSOC);
 
-// ------------------- Breakdown by subject -------------------
-$classSubjectMap = [];
-if ($hasClasses) {
-    foreach ($classInfo as $c) {
-        $classSubjectMap[$c['class_id']] = $c['course_code'];
-    }
+// ------------------- Per-class attendance stats for the last Monday ---
+// SOURCE: attendance_logs — action='in' only, one row per student per class
+$subjectStatsMap = [];
+$attStmt = $db->prepare("
+    SELECT
+        class_id,
+        SUM(attendance_status IN ('on_time','late'))  AS present,
+        SUM(attendance_status = 'absent')              AS absent,
+        SUM(attendance_status = 'late')                AS late,
+        COUNT(*)                                       AS total
+    FROM (
+        SELECT student_id, class_id, attendance_status
+        FROM attendance_logs
+        WHERE DATE(logged_at) = ? AND action = 'in'
+        GROUP BY student_id, class_id
+    ) sub
+    GROUP BY class_id
+");
+$attStmt->execute([$lastMonday]);
+foreach ($attStmt->fetchAll(PDO::FETCH_ASSOC) as $row) {
+    $subjectStatsMap[$row['class_id']] = [
+        'present' => (int)$row['present'],
+        'absent'  => (int)$row['absent'],
+        'late'    => (int)$row['late'],
+        'total'   => (int)$row['total'],
+    ];
 }
 
+// ------------------- Breakdown by subject ---
 function getStatusBreakdown(PDO $db, $date, $status, $classSubjectMap) {
+    // Map attendance_logs status values to the requested status label
+    if ($status === 'Present') {
+        $whereClause = "attendance_status IN ('on_time','late')";
+    } elseif ($status === 'Late') {
+        $whereClause = "attendance_status = 'late'";
+    } else {
+        $whereClause = "attendance_status = 'absent'";
+    }
+
     $sql = "
-        SELECT a.class_id, COUNT(DISTINCT a.student_id) AS total_count
-        FROM attendance a
-        WHERE a.date = ? AND a.status = ?
-        GROUP BY a.class_id
+        SELECT class_id, COUNT(DISTINCT student_id) AS total_count
+        FROM (
+            SELECT student_id, class_id, attendance_status
+            FROM attendance_logs
+            WHERE DATE(logged_at) = ? AND action = 'in'
+            GROUP BY student_id, class_id
+        ) sub
+        WHERE {$whereClause}
+        GROUP BY class_id
     ";
     $stmt = $db->prepare($sql);
-    $stmt->execute([$date, $status]);
+    $stmt->execute([$date]);
     $rows = $stmt->fetchAll(PDO::FETCH_ASSOC);
     $result = [];
     foreach ($rows as $row) {
         $classId = $row['class_id'];
-        $code = $classSubjectMap[$classId] ?? 'Unknown';
+        $code    = $classSubjectMap[$classId] ?? 'Unknown';
         $result[] = [
             'subject_code' => $code,
             'section'      => '',
             'subject_name' => '',
             'total_count'  => $row['total_count'],
-            'year_level'   => '0'
+            'year_level'   => '0',
         ];
     }
     return $result;
@@ -156,6 +236,13 @@ foreach ([&$presentBreakdown, &$lateBreakdown, &$absentBreakdown] as &$breakdown
     foreach ($breakdown as &$item) {
         $code = $item['subject_code'];
         $item['subject_name'] = $subjectNameMap[$code] ?? $code;
+        // Enrich year_level from classInfoMap for breakdown grouping
+        foreach ($classSubjectMap as $cid => $ccode) {
+            if ($ccode === $code && isset($classInfoMap[$cid])) {
+                $item['year_level'] = (string)($classInfoMap[$cid]['year_level'] ?? '0');
+                break;
+            }
+        }
     }
 }
 
@@ -166,32 +253,6 @@ $absentGrouped  = groupFlatByYear($absentBreakdown,  'year_level');
 $presentRate = ($mondayStats['total'] > 0)
     ? round(($mondayStats['present'] / $mondayStats['total']) * 100, 1)
     : 0;
-
-$enrolledMap     = [];
-$subjectStatsMap = [];
-if ($hasClasses) {
-    $enrollStmt = $db->query("SELECT class_id, COUNT(*) AS enrolled FROM student_schedule GROUP BY class_id");
-    foreach ($enrollStmt->fetchAll(PDO::FETCH_ASSOC) as $row) {
-        $enrolledMap[$row['class_id']] = $row['enrolled'];
-    }
-    $attStmt = $db->prepare("
-        SELECT class_id,
-               SUM(status='Present') AS present,
-               SUM(status='Absent')  AS absent,
-               SUM(status='Late')    AS late,
-               COUNT(*) AS total
-        FROM attendance WHERE date = ? GROUP BY class_id
-    ");
-    $attStmt->execute([$lastMonday]);
-    foreach ($attStmt->fetchAll(PDO::FETCH_ASSOC) as $row) {
-        $subjectStatsMap[$row['class_id']] = [
-            'present' => (int)$row['present'],
-            'absent'  => (int)$row['absent'],
-            'late'    => (int)$row['late'],
-            'total'   => (int)$row['total'],
-        ];
-    }
-}
 
 $trendLabels  = array_map(fn($m) => date('M j', strtotime($m['date'])), $mondayTrend);
 $trendPresent = array_map(fn($m) => (int)$m['present'], $mondayTrend);
@@ -228,14 +289,9 @@ $sectionValues = array_map(fn($r) => (int)$r['count'], $sectionCounts);
             --navy:        #1f3b73;
             --soft-blue:   #6db7ff;
             --slate-line:  #98a6bb;
-            /* Matches Profiles dark navbar */
             --nav-bg:      #0d1b2a;
             --nav-height:  62px;
         }
-
-        /* ═══════════════════════════════════════════
-           FIXED NAVBAR — matches Profiles page exactly
-        ═══════════════════════════════════════════ */
         nav,
         .navbar,
         nav.topnav {
@@ -248,7 +304,6 @@ $sectionValues = array_map(fn($r) => (int)$r['count'], $sectionCounts);
             box-shadow: 0 2px 16px rgba(0,0,0,0.30) !important;
             min-height: var(--nav-height);
         }
-
         nav .navbar-brand,
         nav .nav-link,
         nav a,
@@ -258,13 +313,9 @@ $sectionValues = array_map(fn($r) => (int)$r['count'], $sectionCounts);
             font-size: 0.9rem;
             font-weight: 500;
         }
-
         nav .nav-link:hover,
         nav a:hover,
-        .navbar .nav-link:hover {
-            color: #ffffff !important;
-        }
-
+        .navbar .nav-link:hover { color: #ffffff !important; }
         nav .nav-link.active,
         .navbar .nav-link.active {
             background: rgba(255,255,255,0.12) !important;
@@ -273,31 +324,16 @@ $sectionValues = array_map(fn($r) => (int)$r['count'], $sectionCounts);
             padding-left: 12px !important;
             padding-right: 12px !important;
         }
-
-        /* ═══════════════════════════════════════════
-           BODY & LAYOUT
-        ═══════════════════════════════════════════ */
         body {
             background:
                 radial-gradient(circle at top left, rgba(78,115,223,0.07), transparent 28%),
                 linear-gradient(180deg, #f8fbff 0%, #f3f6fb 100%);
             color: var(--text);
             font-family: "Segoe UI", Tahoma, Geneva, Verdana, sans-serif;
-            /* Push content below the fixed navbar */
             padding-top: var(--nav-height);
             margin: 0;
         }
-
-        .dashboard-wrap {
-            max-width: 100%;
-            width: 100%;
-            padding: 28px 32px;
-            box-sizing: border-box;
-        }
-
-        /* ═══════════════════════════════════════════
-           HERO
-        ═══════════════════════════════════════════ */
+        .dashboard-wrap { max-width:100%; width:100%; padding:28px 32px; box-sizing:border-box; }
         .hero-panel {
             background: linear-gradient(135deg, #0d1b2a 0%, #1f3b73 55%, #4e73df 100%);
             color: #fff;
@@ -306,18 +342,8 @@ $sectionValues = array_map(fn($r) => (int)$r['count'], $sectionCounts);
             box-shadow: var(--shadow-md);
             margin-bottom: 28px;
         }
-
-        .hero-title {
-            font-size: 2rem;
-            font-weight: 800;
-            margin-bottom: 8px;
-        }
-
-        .hero-subtitle {
-            color: rgba(255,255,255,0.82);
-            margin-bottom: 0;
-        }
-
+        .hero-title    { font-size:2rem; font-weight:800; margin-bottom:8px; }
+        .hero-subtitle { color:rgba(255,255,255,0.82); margin-bottom:0; }
         .hero-badge {
             display: inline-flex;
             align-items: center;
@@ -331,10 +357,6 @@ $sectionValues = array_map(fn($r) => (int)$r['count'], $sectionCounts);
             backdrop-filter: blur(10px);
             white-space: nowrap;
         }
-
-        /* ═══════════════════════════════════════════
-           SECTION TITLES
-        ═══════════════════════════════════════════ */
         .section-title {
             display: flex;
             align-items: center;
@@ -347,16 +369,7 @@ $sectionValues = array_map(fn($r) => (int)$r['count'], $sectionCounts);
             font-weight: 800;
             font-size: 1.05rem;
         }
-
-        .section-sub {
-            color: var(--muted);
-            font-size: 0.86rem;
-            font-weight: 500;
-        }
-
-        /* ═══════════════════════════════════════════
-           METRIC CARDS
-        ═══════════════════════════════════════════ */
+        .section-sub { color:var(--muted); font-size:0.86rem; font-weight:500; }
         .metric-card {
             position: relative;
             overflow: hidden;
@@ -369,170 +382,52 @@ $sectionValues = array_map(fn($r) => (int)$r['count'], $sectionCounts);
             cursor: default;
             height: 100%;
         }
-
-        .metric-card.clickable { cursor: pointer; }
-
-        .metric-card:hover {
-            transform: translateY(-5px);
-            box-shadow: var(--shadow-md);
-        }
-
+        .metric-card.clickable { cursor:pointer; }
+        .metric-card:hover { transform:translateY(-5px); box-shadow:var(--shadow-md); }
         .metric-card::after {
-            content: "";
-            position: absolute;
-            top: -40px; right: -40px;
-            width: 110px; height: 110px;
-            background: rgba(78,115,223,0.06);
-            border-radius: 50%;
+            content:""; position:absolute; top:-40px; right:-40px;
+            width:110px; height:110px;
+            background:rgba(78,115,223,0.06); border-radius:50%;
         }
-
-        .metric-card.primary { border-top: 4px solid var(--primary); }
-        .metric-card.success { border-top: 4px solid var(--success); }
-        .metric-card.warning { border-top: 4px solid var(--warning); }
-        .metric-card.danger  { border-top: 4px solid var(--danger);  }
-
-        .metric-label {
-            font-size: 0.73rem;
-            font-weight: 800;
-            text-transform: uppercase;
-            letter-spacing: 0.08em;
-            color: var(--muted);
-            margin-bottom: 6px;
-        }
-
-        .metric-value {
-            font-size: 2.1rem;
-            font-weight: 800;
-            line-height: 1;
-            color: #384861;
-        }
-
-        .metric-hint  { font-size: 0.78rem; color: var(--muted); margin-top: 8px; }
-        .metric-extra { margin-top: 10px; font-size: 0.8rem; color: #5d6b80; font-weight: 600; }
-
-        .metric-rate {
-            display: inline-block;
-            margin-top: 8px;
-            padding: 5px 12px;
-            border-radius: 999px;
-            background: rgba(28,200,138,0.12);
-            color: #109868;
-            font-size: 0.78rem;
-            font-weight: 700;
-        }
-
-        /* ═══════════════════════════════════════════
-           BREAKDOWN BOXES
-        ═══════════════════════════════════════════ */
-        .breakdown-box {
-            display: none;
-            background: var(--surface);
-            border: 1px solid var(--border);
-            border-radius: 18px;
-            padding: 22px;
-            margin-bottom: 24px;
-            box-shadow: var(--shadow-sm);
-        }
-
-        .breakdown-box.active { display: block; }
-
-        .breakdown-header {
-            display: flex;
-            justify-content: space-between;
-            align-items: center;
-            margin-bottom: 14px;
-        }
-
-        .breakdown-title { font-weight: 800; margin-bottom: 0; font-size: 1rem; }
-
-        .close-breakdown {
-            border: none;
-            background: #f2f5fa;
-            width: 34px; height: 34px;
-            border-radius: 50%;
-            font-size: 1.2rem;
-            color: #7c8898;
-            cursor: pointer;
-        }
-
-        .mini-year-block  { margin-bottom: 18px; }
-        .mini-year-title  { font-size: 0.9rem; font-weight: 800; color: var(--primary); margin-bottom: 10px; }
-
-        .mini-stat-card {
-            border-radius: 16px;
-            padding: 14px;
-            color: #fff;
-            height: 100%;
-            box-shadow: 0 8px 18px rgba(0,0,0,0.08);
-        }
-
-        .mini-present { background: linear-gradient(135deg,#17b97c,#1cc88a); }
-        .mini-late    { background: linear-gradient(135deg,#f4b400,#f6c23e); color:#2d2400; }
-        .mini-absent  { background: linear-gradient(135deg,#df4d40,#e74a3b); }
-
+        .metric-card.primary { border-top:4px solid var(--primary); }
+        .metric-card.success { border-top:4px solid var(--success); }
+        .metric-card.warning { border-top:4px solid var(--warning); }
+        .metric-card.danger  { border-top:4px solid var(--danger);  }
+        .metric-label  { font-size:0.73rem; font-weight:800; text-transform:uppercase; letter-spacing:0.08em; color:var(--muted); margin-bottom:6px; }
+        .metric-value  { font-size:2.1rem; font-weight:800; line-height:1; color:#384861; }
+        .metric-hint   { font-size:0.78rem; color:var(--muted); margin-top:8px; }
+        .metric-extra  { margin-top:10px; font-size:0.8rem; color:#5d6b80; font-weight:600; }
+        .metric-rate   { display:inline-block; margin-top:8px; padding:5px 12px; border-radius:999px; background:rgba(28,200,138,0.12); color:#109868; font-size:0.78rem; font-weight:700; }
+        .breakdown-box { display:none; background:var(--surface); border:1px solid var(--border); border-radius:18px; padding:22px; margin-bottom:24px; box-shadow:var(--shadow-sm); }
+        .breakdown-box.active { display:block; }
+        .breakdown-header { display:flex; justify-content:space-between; align-items:center; margin-bottom:14px; }
+        .breakdown-title  { font-weight:800; margin-bottom:0; font-size:1rem; }
+        .close-breakdown  { border:none; background:#f2f5fa; width:34px; height:34px; border-radius:50%; font-size:1.2rem; color:#7c8898; cursor:pointer; }
+        .mini-year-block  { margin-bottom:18px; }
+        .mini-year-title  { font-size:0.9rem; font-weight:800; color:var(--primary); margin-bottom:10px; }
+        .mini-stat-card   { border-radius:16px; padding:14px; color:#fff; height:100%; box-shadow:0 8px 18px rgba(0,0,0,0.08); }
+        .mini-present     { background:linear-gradient(135deg,#17b97c,#1cc88a); }
+        .mini-late        { background:linear-gradient(135deg,#f4b400,#f6c23e); color:#2d2400; }
+        .mini-absent      { background:linear-gradient(135deg,#df4d40,#e74a3b); }
         .mini-code  { font-size:0.74rem; font-weight:800; text-transform:uppercase; margin-bottom:8px; opacity:0.95; }
         .mini-count { font-size:1.8rem; font-weight:800; line-height:1; margin-bottom:8px; }
-
-        /* ═══════════════════════════════════════════
-           ANALYTICS
-        ═══════════════════════════════════════════ */
-        .analytics-shell  { margin-bottom: 28px; }
-
-        .analytics-card {
-            background: #fff;
-            border: 1px solid #eef2f7;
-            border-radius: 18px;
-            box-shadow: 0 10px 30px rgba(15,23,42,0.05);
-            padding: 22px 24px;
-        }
-
-        .analytics-grid {
-            display: grid;
-            grid-template-columns: 1fr 1fr;
-            gap: 20px;
-            margin-top: 20px;
-        }
-
-        .analytics-card-head {
-            display: flex;
-            align-items: flex-start;
-            justify-content: space-between;
-            gap: 16px;
-            margin-bottom: 14px;
-        }
-
+        .analytics-shell  { margin-bottom:28px; }
+        .analytics-card   { background:#fff; border:1px solid #eef2f7; border-radius:18px; box-shadow:0 10px 30px rgba(15,23,42,0.05); padding:22px 24px; }
+        .analytics-grid   { display:grid; grid-template-columns:1fr 1fr; gap:20px; margin-top:20px; }
+        .analytics-card-head { display:flex; align-items:flex-start; justify-content:space-between; gap:16px; margin-bottom:14px; }
         .analytics-card-head h5 { margin:0; font-size:1.08rem; font-weight:700; color:#1f2a44; }
         .analytics-card-head p  { margin:4px 0 0; font-size:0.87rem; color:#98a2b3; }
-
         .chart-stats        { display:flex; gap:18px; flex-wrap:wrap; }
-
-        .mini-analytic-stat {
-            display: flex;
-            flex-direction: column;
-            align-items: flex-end;
-            min-width: 72px;
-        }
-
+        .mini-analytic-stat { display:flex; flex-direction:column; align-items:flex-end; min-width:72px; }
         .mini-analytic-stat strong { font-size:1.35rem; line-height:1; color:#1f2a44; }
         .mini-analytic-stat small  { color:#98a2b3; font-size:0.8rem; }
-
-        .legend-dot {
-            width:9px; height:9px;
-            border-radius:50%;
-            margin-bottom:6px;
-            display:inline-block;
-        }
-        .legend-dot.present { background: var(--navy); }
-        .legend-dot.late    { background: var(--soft-blue); }
-        .legend-dot.absent  { background: var(--slate-line); }
-
-        .trend-chart-wrap         { position:relative; height:310px; }
+        .legend-dot         { width:9px; height:9px; border-radius:50%; margin-bottom:6px; display:inline-block; }
+        .legend-dot.present { background:var(--navy); }
+        .legend-dot.late    { background:var(--soft-blue); }
+        .legend-dot.absent  { background:var(--slate-line); }
+        .trend-chart-wrap          { position:relative; height:310px; }
         .distribution-chart-wrap,
-        .section-chart-wrap       { position:relative; height:280px; }
-
-        /* ═══════════════════════════════════════════
-           SUBJECT CARDS
-        ═══════════════════════════════════════════ */
+        .section-chart-wrap        { position:relative; height:280px; }
         .subject-card {
             background: var(--surface);
             border: 1px solid var(--border);
@@ -542,100 +437,49 @@ $sectionValues = array_map(fn($r) => (int)$r['count'], $sectionCounts);
             box-shadow: var(--shadow-sm);
             transition: transform 0.2s ease, box-shadow 0.2s ease;
         }
-
-        .subject-card:hover {
-            transform: translateY(-4px);
-            box-shadow: var(--shadow-md);
-        }
-
-        .subject-head {
-            display:flex;
-            justify-content:space-between;
-            align-items:start;
-            gap:14px;
-            margin-bottom:12px;
-        }
-
+        .subject-card:hover { transform:translateY(-4px); box-shadow:var(--shadow-md); }
+        .subject-head { display:flex; justify-content:space-between; align-items:start; gap:14px; margin-bottom:12px; }
         .subject-code {
-            display:inline-flex;
-            align-items:center;
-            padding:4px 10px;
-            border-radius:999px;
-            background:#eef2ff;
-            color:var(--primary);
-            font-size:0.72rem;
-            font-weight:800;
-            letter-spacing:0.05em;
-            text-transform:uppercase;
-            margin-bottom:8px;
+            display:inline-flex; align-items:center;
+            padding:4px 10px; border-radius:999px;
+            background:#eef2ff; color:var(--primary);
+            font-size:0.72rem; font-weight:800;
+            letter-spacing:0.05em; text-transform:uppercase; margin-bottom:8px;
         }
-
         .teacher-name { color:var(--muted); font-size:0.9rem; margin-bottom:0; }
-
-        .year-header {
-            background: #eef3ff;
-            border: 1px solid #dbe5ff;
-            border-left: 4px solid var(--primary);
-            padding: 10px 16px;
-            border-radius: 12px;
-            color: var(--primary);
-            font-weight: 800;
-            margin: 28px 0 16px;
-            font-size: 0.96rem;
+        .year-header  {
+            background:#eef3ff; border:1px solid #dbe5ff;
+            border-left:4px solid var(--primary);
+            padding:10px 16px; border-radius:12px;
+            color:var(--primary); font-weight:800;
+            margin:28px 0 16px; font-size:0.96rem;
         }
-
         .sub-section-box {
-            background: #fbfcff;
-            border: 1px solid #e7edf7;
-            border-radius: 14px;
-            padding: 14px 15px;
-            margin-bottom: 10px;
-            transition: background 0.16s, border-color 0.16s, transform 0.16s;
+            background:#fbfcff; border:1px solid #e7edf7;
+            border-radius:14px; padding:14px 15px; margin-bottom:10px;
+            transition:background 0.16s, border-color 0.16s, transform 0.16s;
         }
-
-        .sub-section-box:hover {
-            background: #f4f8ff;
-            border-color: #d7e4fb;
-            transform: translateX(4px);
-        }
-
+        .sub-section-box:hover { background:#f4f8ff; border-color:#d7e4fb; transform:translateX(4px); }
         .stats-row  { display:flex; gap:10px; flex-wrap:wrap; }
-
-        .stat-item {
-            text-align:center;
-            padding:9px 14px;
-            border-radius:10px;
-            background:#f5f8fc;
-            min-width:74px;
-        }
-
+        .stat-item  { text-align:center; padding:9px 14px; border-radius:10px; background:#f5f8fc; min-width:74px; }
         .stat-present { color:var(--success); font-weight:800; }
         .stat-absent  { color:var(--danger);  font-weight:800; }
         .stat-late    { color:#b88700;         font-weight:800; }
-
-        /* ═══════════════════════════════════════════
-           OTHER REPORTS LIST
-        ═══════════════════════════════════════════ */
         .list-card { background:var(--surface); border:1px solid var(--border); border-radius:var(--radius); box-shadow:var(--shadow-sm); overflow:hidden; }
         .list-group-item { border-left:none; border-right:none; padding:16px 18px; font-weight:600; }
         .list-group-item:first-child { border-top:none; }
         .list-group-item:last-child  { border-bottom:none; }
-
         .no-data { color:var(--muted); font-style:italic; font-size:0.86rem; }
-
-        /* ═══════════════════════════════════════════
-           RESPONSIVE
-        ═══════════════════════════════════════════ */
-        @media (max-width: 991px) {
-            .analytics-grid          { grid-template-columns: 1fr; }
-            .analytics-card-head     { flex-direction: column; }
-            .mini-analytic-stat      { align-items: flex-start; }
-            .dashboard-wrap          { padding: 20px 16px; }
+        @media (max-width:991px) {
+            .analytics-grid { grid-template-columns:1fr; }
+            .analytics-card-head { flex-direction:column; }
+            .mini-analytic-stat  { align-items:flex-start; }
+            .dashboard-wrap      { padding:20px 16px; }
         }
-        @media (max-width: 768px) {
-            .trend-chart-wrap                           { height: 240px; }
-            .distribution-chart-wrap,.section-chart-wrap{ height: 240px; }
-            .hero-title                                 { font-size: 1.5rem; }
+        @media (max-width:768px) {
+            .trend-chart-wrap                            { height:240px; }
+            .distribution-chart-wrap,.section-chart-wrap { height:240px; }
+            .hero-title                                  { font-size:1.5rem; }
         }
     </style>
 </head>
@@ -695,7 +539,7 @@ $sectionValues = array_map(fn($r) => (int)$r['count'], $sectionCounts);
         </div>
     </div>
 
-    <!-- Breakdown boxes -->
+    <!-- Breakdown boxes (unchanged structure) -->
     <div id="present-breakdown" class="breakdown-box">
         <div class="breakdown-header">
             <div class="breakdown-title text-success">Present Breakdown by Subject</div>
@@ -778,7 +622,6 @@ $sectionValues = array_map(fn($r) => (int)$r['count'], $sectionCounts);
     </div>
 
     <div class="analytics-shell mb-5">
-        <!-- Trend chart -->
         <div class="analytics-card mb-4">
             <div class="analytics-card-head">
                 <div>
@@ -810,7 +653,6 @@ $sectionValues = array_map(fn($r) => (int)$r['count'], $sectionCounts);
             <?php endif; ?>
         </div>
 
-        <!-- Distribution + Section -->
         <div class="analytics-grid">
             <div class="analytics-card">
                 <div class="analytics-card-head">
@@ -845,9 +687,16 @@ $sectionValues = array_map(fn($r) => (int)$r['count'], $sectionCounts);
         <div class="year-header"><?= yearLabel($yearLevel) ?></div>
         <div class="row">
         <?php foreach ($subjList as $subj):
-            $code    = $subj['course_code'];
-            $name    = $subj['subject_name'];
-            $section = $subj['section'] ?: 'N/A';
+            $code      = $subj['course_code'];
+            $name      = $subj['subject_name'];
+            $section   = $subj['section'];
+            $teacher   = $subj['teacher_name'];
+            $enrolled  = $subj['enrolled'];
+            $classId   = $subj['class_id'];
+            $classStats = $classId ? ($subjectStatsMap[$classId] ?? []) : [];
+            $present   = (int)($classStats['present'] ?? 0);
+            $absent    = (int)($classStats['absent']  ?? 0);
+            $late      = (int)($classStats['late']    ?? 0);
         ?>
         <div class="col-md-6">
             <div class="subject-card">
@@ -855,19 +704,23 @@ $sectionValues = array_map(fn($r) => (int)$r['count'], $sectionCounts);
                     <div>
                         <div class="subject-code"><?= htmlspecialchars($code) ?></div>
                         <h5 class="mb-1 text-dark"><?= htmlspecialchars($name) ?></h5>
-                        <p class="teacher-name">Teacher: <strong>Not assigned</strong> &nbsp;&middot;&nbsp; <?= htmlspecialchars($section) ?></p>
+                        <p class="teacher-name">
+                            Teacher: <strong><?= htmlspecialchars($teacher) ?></strong>
+                            &nbsp;&middot;&nbsp;
+                            <?= htmlspecialchars($section) ?>
+                        </p>
                     </div>
                 </div>
                 <div class="sub-section-box">
                     <div class="d-flex justify-content-between align-items-center">
                         <div>
                             <strong>Section <?= htmlspecialchars($section) ?></strong>
-                            <small class="d-block text-muted">Enrolled: --</small>
+                            <small class="d-block text-muted">Enrolled: <?= $enrolled ?></small>
                         </div>
                         <div class="stats-row">
-                            <div class="stat-item"><span class="stat-present">0</span><small>Present</small></div>
-                            <div class="stat-item"><span class="stat-absent">0</span><small>Absent</small></div>
-                            <div class="stat-item"><span class="stat-late">0</span><small>Late</small></div>
+                            <div class="stat-item"><span class="stat-present"><?= $present ?></span><small>Present</small></div>
+                            <div class="stat-item"><span class="stat-absent"><?= $absent ?></span><small>Absent</small></div>
+                            <div class="stat-item"><span class="stat-late"><?= $late ?></span><small>Late</small></div>
                         </div>
                     </div>
                 </div>
@@ -890,7 +743,7 @@ $sectionValues = array_map(fn($r) => (int)$r['count'], $sectionCounts);
         </div>
     </div>
 
-</div><!-- /.dashboard-wrap -->
+</div>
 
 <script>
 function hideAllBreakdowns() {
@@ -904,7 +757,7 @@ function toggleBreakdown(type) {
     hideAllBreakdowns();
     if (!open) {
         target.classList.add('active');
-        target.scrollIntoView({ behavior: 'smooth', block: 'center' });
+        target.scrollIntoView({ behavior:'smooth', block:'center' });
     }
 }
 
@@ -928,7 +781,7 @@ new Chart(document.getElementById('mondayChart'), {
         maintainAspectRatio: false,
         cutout: '68%',
         plugins: {
-            legend: { position: 'right', labels: { usePointStyle: true, pointStyle: 'circle', boxWidth: 9, boxHeight: 9, padding: 18 } }
+            legend: { position:'right', labels:{ usePointStyle:true, pointStyle:'circle', boxWidth:9, boxHeight:9, padding:18 } }
         }
     }
 });
@@ -940,9 +793,9 @@ new Chart(document.getElementById('trendChart'), {
     data: {
         labels: <?= json_encode($trendLabels) ?>,
         datasets: [
-            { label:'Present', data: <?= json_encode($trendPresent) ?>, borderColor:'#1f3b73', backgroundColor:'rgba(31,59,115,0.07)', fill:true, tension:0.42, pointRadius:4, borderWidth:2.2 },
-            { label:'Late',    data: <?= json_encode($trendLate) ?>,    borderColor:'#6db7ff', backgroundColor:'rgba(109,183,255,0.07)', fill:true, tension:0.42, pointRadius:4, borderWidth:2 },
-            { label:'Absent',  data: <?= json_encode($trendAbsent) ?>,  borderColor:'#98a6bb', backgroundColor:'rgba(152,166,187,0.04)', fill:true, tension:0.42, pointRadius:4, borderWidth:2 }
+            { label:'Present', data:<?= json_encode($trendPresent) ?>, borderColor:'#1f3b73', backgroundColor:'rgba(31,59,115,0.07)', fill:true, tension:0.42, pointRadius:4, borderWidth:2.2 },
+            { label:'Late',    data:<?= json_encode($trendLate) ?>,    borderColor:'#6db7ff', backgroundColor:'rgba(109,183,255,0.07)', fill:true, tension:0.42, pointRadius:4, borderWidth:2 },
+            { label:'Absent',  data:<?= json_encode($trendAbsent) ?>,  borderColor:'#98a6bb', backgroundColor:'rgba(152,166,187,0.04)', fill:true, tension:0.42, pointRadius:4, borderWidth:2 }
         ]
     },
     options: {
@@ -965,8 +818,8 @@ new Chart(document.getElementById('sectionChart'), {
     data: {
         labels: <?= json_encode($sectionLabels) ?>,
         datasets: [
-            { type:'bar',  label:'Students',       data: <?= json_encode($sectionValues) ?>, backgroundColor:'rgba(255,205,210,0.35)', borderColor:'#ef9aa5', borderWidth:1.4, borderRadius:8, order:2 },
-            { type:'line', label:'Students Trend', data: <?= json_encode($sectionValues) ?>, borderColor:'#1f3b73', tension:0.38, pointRadius:3, borderWidth:2.2, fill:false, order:1 }
+            { type:'bar',  label:'Students',       data:<?= json_encode($sectionValues) ?>, backgroundColor:'rgba(255,205,210,0.35)', borderColor:'#ef9aa5', borderWidth:1.4, borderRadius:8, order:2 },
+            { type:'line', label:'Students Trend', data:<?= json_encode($sectionValues) ?>, borderColor:'#1f3b73', tension:0.38, pointRadius:3, borderWidth:2.2, fill:false, order:1 }
         ]
     },
     options: {
