@@ -2,7 +2,7 @@
 require_once __DIR__ . '/config.php';
 requireTeacher();
 $pdo        = db();
-$teacher_id = (int)$_SESSION;
+$teacher_id = (int)($_SESSION['t_id'] ?? 0);   // logged-in teacher (used as reviewed_by)
 $success    = '';
 $error      = '';
 

@@ -5,6 +5,8 @@
 // ============================================================================
 
 require_once __DIR__ . '/../includes/auth.php';
+require_once __DIR__ . '/attendance_sync.php';
+require_once __DIR__ . '/../includes/mailer.php';   // PHPMailer-based parent e-mail notifications
 
 // Enable error logging
 error_reporting(E_ALL);
@@ -37,6 +39,13 @@ function sendSmsNotification(
     bool   $isLate      = false,
     string $subjectName = ''
 ): array {
+    // Defensive: if the cURL extension isn't loaded, fail gracefully instead of
+    // throwing a fatal that would abort attendance recording AND the e-mail.
+    if (!function_exists('curl_init')) {
+        error_log('SMS skipped: cURL extension not available.');
+        return ['status' => 'failed', 'error' => 'cURL extension not available'];
+    }
+
     $phone = str_replace('+', '', trim($toNumber));
     if (str_starts_with($phone, '09')) {
         $phone = '63' . substr($phone, 1);
@@ -106,6 +115,7 @@ function getStudentProfile(string $scannedId, mysqli $conn): ?array {
             s.created_at,
             p.parent_name,
             p.contact_number AS parent_contact,
+            p.email AS parent_email,
             p.relationship
         FROM students s
         LEFT JOIN parents p ON p.student_id = s.id
@@ -386,15 +396,22 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['student_id'])) {
     
     $lastAction = $lastLog['action'] ?? null;
     $action = (!$lastAction || $lastAction === 'out') ? 'in' : 'out';
-    
-    if ($action === 'in' && $lastLog && strtotime($lastLog['logged_at']) > strtotime('-30 seconds')) {
-        $conn->close();
-        echo json_encode([
-            'success' => false,
-            'message' => 'Please wait 30 seconds before scanning again.',
-            'duplicate' => true
-        ]);
-        exit;
+
+    // Anti double-read only: a barcode scanner often fires the SAME code twice
+    // within a fraction of a second. Block just those near-instant repeats so a
+    // real time-in → time-out toggle (seconds/minutes apart) still goes through.
+    $debounce = defined('SCAN_DEBOUNCE_SECONDS') ? (int) SCAN_DEBOUNCE_SECONDS : 3;
+    if ($lastLog) {
+        $secsSinceLast = strtotime($now->format('Y-m-d H:i:s')) - strtotime($lastLog['logged_at']);
+        if ($secsSinceLast >= 0 && $secsSinceLast < $debounce) {
+            $conn->close();
+            echo json_encode([
+                'success'   => false,
+                'message'   => 'Please wait a moment before scanning again.',
+                'duplicate' => true
+            ]);
+            exit;
+        }
     }
     
     $status = $isLate ? 'late' : 'on_time';
@@ -455,7 +472,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['student_id'])) {
     $loggedAt = $now->format('Y-m-d H:i:s');
     $smsSentInt = $smsSent ? 1 : 0;
     $scannedBy = 'student_terminal';
-    
+
     $stmt = $conn->prepare("
         INSERT INTO attendance_logs 
             (student_id, student_number, class_id, schedule_id, scanned_by, action, 
@@ -463,12 +480,67 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['student_id'])) {
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
     ");
     $stmt->bind_param(
-        'isiissiis',
+        // i  s  i  i  s  s  s  i  s   ← attendance_status (pos 7) is a STRING.
+        // The original 'isiissiis' bound it as an int, so 'on_time'/'late' became
+        // 0 and the enum stored '' (see the blank values in the seed data) or, on
+        // a strict-mode server, errored with "Data truncated". This is the fix.
+        'isiisssis',
         $studentPk, $studentNumber, $classId, $scheduleId, $scannedBy,
         $action, $status, $smsSentInt, $loggedAt
     );
     $stmt->execute();
+    $logId = (int) $conn->insert_id;
     $stmt->close();
+
+    syncAttendanceSummary(
+    $conn,
+    $studentPk,
+    $classId,
+    (int) ($activeSchedule['teacher_id'] ?? 0),
+    $action,
+    $isLate,
+    $now
+);
+
+    // ========== SEND EMAIL TO PARENT/GUARDIAN (PHPMailer/SMTP) ==========
+    // Fires on BOTH time-in and time-out so the parent gets the full picture.
+    $teacherName = $activeSchedule['instructor_name']
+                 ?? $activeSchedule['instructor_full_name']
+                 ?? 'TBA';
+    $statusText  = ($action === 'out') ? 'Checked Out' : ($isLate ? 'Late' : 'On Time');
+
+    $emailResult = notifyParentByEmail([
+        'student_id'      => $studentPk,
+        'log_id'          => $logId,
+        'student_name'    => $fullName,
+        'student_number'  => $studentNumber,
+        'parent_name'     => $student['parent_name']  ?? '',
+        'parent_email'    => $student['parent_email'] ?? '',
+        'student_email'   => $student['email']        ?? '',
+        'subject_name'    => $activeSchedule['subject_name'] ?? '—',
+        'subject_code'    => $activeSchedule['subject_code'] ?? $activeSchedule['course_code'] ?? '',
+        'teacher_name'    => $teacherName,
+        'room'            => $activeSchedule['room'] ?? 'TBA',
+        'section'         => $activeSchedule['section'] ?? $section,
+        'date_str'        => $now->format('l, F j, Y'),
+        'time_str'        => $now->format('h:i A'),
+        'status_text'     => $statusText,
+        'action'          => $action,
+        'is_late'         => $isLate,
+        'school_name'     => defined('APP_NAME') ? APP_NAME : 'Student Attendance Monitoring System',
+    ]);
+    $emailSent   = ($emailResult['status'] === 'sent' || $emailResult['status'] === 'test');
+    $emailStatus = $emailResult['status'];
+
+    // Persist notification flags on the log row we just created.
+    $emailSentInt = $emailSent ? 1 : 0;
+    $notifInt     = ($emailSent || $smsSent) ? 1 : 0;
+    $upd = $conn->prepare("UPDATE attendance_logs SET email_sent = ?, notification_sent = ? WHERE log_id = ?");
+    $upd->bind_param('iii', $emailSentInt, $notifInt, $logId);
+    $upd->execute();
+    $upd->close();
+    // ========== END EMAIL ==========
+
     $conn->close();
     
     // Prepare response
@@ -518,6 +590,9 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['student_id'])) {
         'sms_sent' => $smsSent,
         'sms_result' => $smsResult,
         'sms_to' => $guardianPhone,
+        'email_sent' => $emailSent,
+        'email_status' => $emailStatus,
+        'email_to' => $emailResult['recipient'] ?? '',
         'test_mode' => SMS_TEST_MODE
     ]);
     exit;
@@ -528,7 +603,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['student_id'])) {
 <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
-    <title>Student Attendance Scanner | SCANTRACK</title>
+    <title>Student Attendance Scanner | </title>
     <link href="https://fonts.googleapis.com/css2?family=Orbitron:wght@400;700;900&family=Exo+2:wght@300;400;600&display=swap" rel="stylesheet"/>
     <style>
         :root {
@@ -604,10 +679,13 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['student_id'])) {
         .notif-time { margin-left: auto; text-align: right; flex-shrink: 0; }
         .notif-timestamp { font-family: 'Orbitron', monospace; font-size: 1.3rem; font-weight: 700; color: var(--text); }
         .notif-datestamp { font-size: 0.75rem; color: var(--muted); margin-top: 4px; letter-spacing: 0.05em; }
-        .late-badge, .sms-badge { display: none; margin-top: 6px; padding: 3px 10px; border-radius: 20px; font-size: 0.72rem; letter-spacing: 0.12em; font-family: 'Orbitron', monospace; text-transform: uppercase; }
+        .late-badge, .sms-badge, .email-badge { display: none; margin-top: 6px; padding: 3px 10px; border-radius: 20px; font-size: 0.72rem; letter-spacing: 0.12em; font-family: 'Orbitron', monospace; text-transform: uppercase; }
         .late-badge { background: rgba(245,197,24,0.15); border: 1px solid rgba(245,197,24,0.4); color: var(--late); }
         .sms-badge.sent { background: rgba(0,255,157,0.12); border: 1px solid rgba(0,255,157,0.35); color: var(--accent2); }
         .sms-badge.failed { background: rgba(255,80,80,0.10); border: 1px solid rgba(255,80,80,0.35); color: #ff8080; }
+        .email-badge.sent { background: rgba(0,200,255,0.12); border: 1px solid rgba(0,200,255,0.35); color: var(--accent); }
+        .email-badge.failed { background: rgba(255,80,80,0.10); border: 1px solid rgba(255,80,80,0.35); color: #ff8080; }
+        .email-badge.skipped { background: rgba(74,122,155,0.15); border: 1px solid rgba(74,122,155,0.4); color: var(--muted); }
         .badge-row { display: flex; align-items: center; flex-wrap: wrap; gap: 4px; margin-top: 2px; }
         .subject-strip, .student-details, .schedule-list { margin-top: 18px; padding-top: 16px; border-top: 1px solid rgba(0,200,255,0.1); display: none; flex-wrap: wrap; gap: 20px; }
         .subject-chip { display: flex; flex-direction: column; gap: 2px; }
@@ -626,7 +704,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['student_id'])) {
 <?php require_once __DIR__ . '/../includes/nav.php'; renderNav('scanner'); ?>
 
 <header>
-    <div class="logo">SCAN<span>TRACK</span></div>
+    <div class="logo"></div>
     <div>
         <div id="live-clock">00:00:00</div>
         <div id="live-date">—</div>
@@ -682,6 +760,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['student_id'])) {
                     <div class="badge-row">
                         <div id="late-badge" class="late-badge">⏱ MARKED LATE</div>
                         <div id="sms-badge" class="sms-badge">📱 SMS SENT</div>
+                        <div id="email-badge" class="email-badge">📧 EMAIL SENT</div>
                     </div>
                 </div>
                 <div class="notif-time">
@@ -739,6 +818,7 @@ function submitScan(id) {
             if (data.success) showSuccess(data);
             else if (data.not_found) showNotFound(id);
             else if (data.no_class) showNoClass(data, id);
+            else if (data.duplicate) showDuplicate(data, id);
         })
         .catch((err) => { console.error('Fetch error:', err); showNotFound(id); })
         .finally(() => setTimeout(() => input.focus(), 10));
@@ -752,6 +832,8 @@ function resetNotif() {
     document.getElementById('late-badge').style.display = 'none';
     document.getElementById('sms-badge').style.display = 'none';
     document.getElementById('sms-badge').className = 'sms-badge';
+    document.getElementById('email-badge').style.display = 'none';
+    document.getElementById('email-badge').className = 'email-badge';
     document.getElementById('subject-strip').style.display = 'none';
     document.getElementById('student-details').style.display = 'none';
     document.getElementById('schedule-list').style.display = 'none';
@@ -789,6 +871,12 @@ function showSuccess(data) {
         if (data.sms_sent) { smsBadge.classList.add('sent'); smsBadge.textContent = '📱 SMS SENT'; }
         else { smsBadge.classList.add('failed'); smsBadge.textContent = '📵 SMS FAILED'; }
     }
+    if (data.email_status && data.email_status !== 'skipped') {
+        const emailBadge = document.getElementById('email-badge');
+        emailBadge.style.display = 'inline-block';
+        if (data.email_sent) { emailBadge.classList.add('sent'); emailBadge.textContent = '📧 EMAIL SENT'; }
+        else { emailBadge.classList.add('failed'); emailBadge.textContent = '📭 EMAIL FAILED'; }
+    }
     document.getElementById('subject-strip').style.display = 'flex';
     document.getElementById('chip-subject').textContent = data.subject_name;
     document.getElementById('chip-code').textContent = data.subject_code;
@@ -809,6 +897,13 @@ function showNotFound(id) {
     const now = new Date();
     setCommon('⚠️', '● NOT FOUND', 'Unrecognized ID', 'ID: ' + id + ' — not registered', now.toLocaleTimeString('en-PH', { hour12: true }), now.toLocaleDateString('en-PH', { weekday: 'short', month: 'short', day: 'numeric', year: 'numeric' }));
     revealNotif('not-found');
+}
+
+function showDuplicate(data, id) {
+    resetNotif();
+    const now = new Date();
+    setCommon('⏳', '● PLEASE WAIT', data.message || 'Duplicate scan ignored', 'ID: ' + id, now.toLocaleTimeString('en-PH', { hour12: true }), now.toLocaleDateString('en-PH', { weekday: 'short', month: 'short', day: 'numeric', year: 'numeric' }));
+    revealNotif('no-class');
 }
 
 function showNoClass(data, id) {

@@ -1,143 +1,168 @@
 <?php
 // ============================================================================
 // profiles/crud.php — JSON API for Records / Profile Management
-// Ported to the unified database (student_attendance_system) + compat views.
 // ============================================================================
 error_reporting(E_ALL);
 ini_set('display_errors', 0);
 ini_set('log_errors', 1);
-
 header('Content-Type: application/json');
 
-// ── Foundation: session + db() (define $pdo HERE so it is never "undefined") ─
 require_once __DIR__ . '/../includes/auth.php';
 
-// JSON-safe auth guard (do NOT redirect — an AJAX caller expects JSON, not HTML)
 if (!isLoggedIn() || !in_array(currentUser()['role'], ['admin', 'super_admin'], true)) {
     http_response_code(403);
     echo json_encode(['status' => 'error', 'message' => 'Not authorized']);
     exit;
 }
 
-$pdo = db();   // <-- the shared PDO connection, now a real local variable
-
+$pdo = db();
 $action = $_POST['action'] ?? $_GET['action'] ?? '';
+
+// ----------------------------------------------------------------------------
+// Helper: Handle teacher profile image upload
+// ----------------------------------------------------------------------------
+function handleTeacherImageUpload($existingPath = '') {
+    if (!isset($_FILES['profile_picture_file']) || $_FILES['profile_picture_file']['error'] === UPLOAD_ERR_NO_FILE) {
+        return $existingPath; // keep existing
+    }
+    $file = $_FILES['profile_picture_file'];
+    if ($file['error'] !== UPLOAD_ERR_OK) {
+        throw new Exception('File upload error: ' . $file['error']);
+    }
+    $allowed = ['image/jpeg', 'image/png', 'image/webp'];
+    $finfo = finfo_open(FILEINFO_MIME_TYPE);
+    $mime = finfo_file($finfo, $file['tmp_name']);
+    finfo_close($finfo);
+    if (!in_array($mime, $allowed)) {
+        throw new Exception('Only JPG, PNG, WEBP images are allowed');
+    }
+    if ($file['size'] > 2 * 1024 * 1024) { // 2MB
+        throw new Exception('File size must be less than 2MB');
+    }
+    // Upload to project root /uploads/teachers/ (one level above profiles)
+    $uploadDir = __DIR__ . '/../uploads/teachers/';
+    if (!is_dir($uploadDir)) {
+        mkdir($uploadDir, 0755, true);
+    }
+    $ext = pathinfo($file['name'], PATHINFO_EXTENSION);
+    $newFileName = 'teacher_' . time() . '_' . bin2hex(random_bytes(8)) . '.' . $ext;
+    $destination = $uploadDir . $newFileName;
+    if (!move_uploaded_file($file['tmp_name'], $destination)) {
+        throw new Exception('Failed to save uploaded file');
+    }
+    // Delete old file if exists and different
+    if (!empty($existingPath) && file_exists(__DIR__ . '/../' . $existingPath)) {
+        unlink(__DIR__ . '/../' . $existingPath);
+    }
+    // Store path relative to project root (no leading slash)
+    return 'uploads/teachers/' . $newFileName;
+}
 
 try {
     switch ($action) {
-
-        // ── READ: students grouped by subject (reads via compat views) ──────
+        // ========== STUDENT: get students grouped by subject ==========
         case 'get_students_by_subject':
-            $subject_code = $_GET['subject'] ?? 'all';
-            $search       = $_GET['search']  ?? '';
-            $day          = $_GET['day']     ?? '';
+            $subject_code = trim($_GET['subject'] ?? 'all');
+            $search = trim($_GET['search'] ?? '');
+            $day = $_GET['day'] ?? '';
 
-            $sql = "SELECT
-                        s.id AS student_db_id, s.student_id, s.full_name, s.gender,
-                        s.course, s.year_level, s.contact, s.email,
-                        s.parent_name, s.parent_contact,
-                        c.class_id, c.section, c.subject_code, c.subject_name,
-                        sch.schedule_id, sch.day, sch.time, sch.room, sch.instructor
+            $sql = "SELECT s.id AS student_db_id, s.student_number AS student_id, s.full_name, s.gender,
+                           s.course, s.year_level, s.contact, s.email,
+                           p.parent_name, p.contact_number AS parent_contact,
+                           c.class_id, c.section, sub.course_code AS subject_code, sub.subject_name,
+                           sch.schedule_id, sch.day, 
+                           CONCAT(TIME_FORMAT(sch.start_time,'%l:%i %p'),' - ',TIME_FORMAT(sch.end_time,'%l:%i %p')) AS time,
+                           sch.room,
+                           COALESCE(u.full_name, 'Not assigned') AS instructor
                     FROM student_schedule ss
-                    JOIN v_students  s   ON ss.student_id  = s.id
-                    JOIN v_classes   c   ON ss.class_id    = c.class_id
-                    JOIN v_schedules sch ON ss.schedule_id = sch.schedule_id
-                    WHERE 1=1
-                      AND c.class_code != 'A28'";
+                    JOIN students s ON ss.student_id = s.id
+                    LEFT JOIN parents p ON p.student_id = s.id
+                    JOIN classes c ON ss.class_id = c.class_id
+                    JOIN subjects sub ON c.course_code = sub.course_code
+                    JOIN schedules sch ON ss.schedule_id = sch.schedule_id
+                    LEFT JOIN teachers t ON c.teacher_id = t.id
+                    LEFT JOIN users u ON t.user_id = u.id
+                    WHERE 1=1";
+
             $params = [];
-            if ($subject_code !== 'all') { $sql .= " AND c.subject_code = ?"; $params[] = $subject_code; }
-            if ($search !== '')          { $sql .= " AND s.full_name LIKE ?"; $params[] = "%$search%"; }
-            if ($day !== '' && $day !== 'all') { $sql .= " AND sch.day = ?";  $params[] = $day; }
-            $sql .= " ORDER BY c.subject_code, s.full_name ASC";
+            if ($subject_code !== 'all') {
+                $sql .= " AND UPPER(TRIM(sub.course_code)) = UPPER(TRIM(?))";
+                $params[] = $subject_code;
+            }
+            if ($search !== '') {
+                $sql .= " AND s.full_name LIKE ?";
+                $params[] = "%$search%";
+            }
+            if ($day !== '' && $day !== 'all') {
+                $sql .= " AND sch.day = ?";
+                $params[] = $day;
+            }
+            $sql .= " ORDER BY sub.course_code, s.full_name ASC";
 
             $stmt = $pdo->prepare($sql);
             $stmt->execute($params);
+            $rows = $stmt->fetchAll(PDO::FETCH_ASSOC);
 
             $grouped = [];
-            foreach ($stmt->fetchAll() as $row) {
+            foreach ($rows as $row) {
                 $grouped[$row['subject_name']][] = $row;
             }
             echo json_encode($grouped);
             break;
 
-        // ── READ: classes + their schedules (for the add-student dropdowns) ─
+        // ========== READ: classes + schedules (for add‑student dropdown) ==========
         case 'get_classes':
-            $stmt = $pdo->query(
-                "SELECT c.class_id, c.subject_code, c.subject_name, c.section,
-                        sch.schedule_id, sch.day, sch.time, sch.instructor
-                 FROM v_classes c
-                 JOIN v_schedules sch ON sch.class_id = c.class_id
-                 WHERE c.class_code != 'A28'
-                 ORDER BY c.subject_name, sch.day"
-            );
+            $stmt = $pdo->query("
+                SELECT c.class_id, sub.course_code AS subject_code, sub.subject_name, c.section,
+                       sch.schedule_id, sch.day, 
+                       CONCAT(TIME_FORMAT(sch.start_time,'%l:%i %p'),' - ',TIME_FORMAT(sch.end_time,'%l:%i %p')) AS time,
+                       sch.room, u.full_name AS instructor
+                FROM classes c
+                JOIN subjects sub ON c.course_code = sub.course_code
+                JOIN schedules sch ON sch.class_id = c.class_id
+                LEFT JOIN teachers t ON c.teacher_id = t.id
+                LEFT JOIN users u ON t.user_id = u.id
+                WHERE c.class_code != 'A28'
+                ORDER BY sub.subject_name, sch.day
+            ");
             echo json_encode($stmt->fetchAll());
             break;
 
-        // ── CREATE student → write to REAL tables (students + parents) ──────
-        case 'add_student':
-            $required = ['student_id','full_name','gender','course','year_level','contact','email','parent_name','parent_contact','class_id','schedule_id'];
-            foreach ($required as $f) {
-                if (empty($_POST[$f])) { echo json_encode(['status'=>'error','message'=>"Field '$f' is required"]); exit; }
-            }
-            if (!filter_var($_POST['email'], FILTER_VALIDATE_EMAIL)) {
-                echo json_encode(['status'=>'error','message'=>'Invalid email format']); exit;
-            }
-
-            $pdo->beginTransaction();
-            try {
-                // students.student_number holds the school ID (the form's student_id)
-                $stmt = $pdo->prepare(
-                    "INSERT INTO students (student_number, full_name, gender, course, year_level, contact, email)
-                     VALUES (?,?,?,?,?,?,?)"
-                );
-                $stmt->execute([
-                    $_POST['student_id'], $_POST['full_name'], $_POST['gender'], $_POST['course'],
-                    $_POST['year_level'], $_POST['contact'], $_POST['email']
-                ]);
-                $newId = $pdo->lastInsertId();
-
-                // parent info goes to the normalized parents table
-                $pdo->prepare("INSERT INTO parents (student_id, parent_name, contact_number) VALUES (?,?,?)")
-                    ->execute([$newId, $_POST['parent_name'], $_POST['parent_contact']]);
-
-                // enrollment
-                $pdo->prepare("INSERT INTO student_schedule (student_id, schedule_id, class_id) VALUES (?,?,?)")
-                    ->execute([$newId, $_POST['schedule_id'], $_POST['class_id']]);
-
-                $pdo->commit();
-                echo json_encode(['status'=>'success','message'=>'Student added successfully']);
-            } catch (Exception $e) {
-                $pdo->rollBack();
-                echo json_encode(['status'=>'error','message'=>'Database error: '.$e->getMessage()]);
-            }
+        // ========== READ: distinct subject codes for filter dropdown ==========
+        case 'get_subject_list':
+            $stmt = $pdo->query("SELECT DISTINCT TRIM(course_code) AS subject_code FROM subjects WHERE course_code IS NOT NULL ORDER BY course_code");
+            $subjects = $stmt->fetchAll(PDO::FETCH_COLUMN);
+            $stmt2 = $pdo->query("SELECT DISTINCT TRIM(course_code) FROM classes WHERE course_code IS NOT NULL");
+            $classSubjects = $stmt2->fetchAll(PDO::FETCH_COLUMN);
+            $merged = array_unique(array_merge($subjects, $classSubjects));
+            sort($merged);
+            echo json_encode($merged);
             break;
 
-        // ── READ one student (view gives parent fields for the edit form) ───
+        // ========== READ one student ==========
         case 'get_profile':
             $id = $_GET['id'] ?? 0;
             if (!$id) { echo json_encode(['status'=>'error','message'=>'Invalid ID']); exit; }
-            $stmt = $pdo->prepare("SELECT * FROM v_students WHERE id = ?");
+            $stmt = $pdo->prepare("
+                SELECT s.id, s.student_number AS student_id, s.full_name, s.gender, s.course, s.year_level,
+                       s.contact, s.email, p.parent_name, p.contact_number AS parent_contact, s.created_at
+                FROM students s
+                LEFT JOIN parents p ON p.student_id = s.id
+                WHERE s.id = ?
+            ");
             $stmt->execute([$id]);
-            $data = $stmt->fetch();
-            if ($data) { $data['status'] = 'success'; echo json_encode($data); }
-            else       { echo json_encode(['status'=>'error','message'=>'Student not found']); }
+            $data = $stmt->fetch(PDO::FETCH_ASSOC);
+            echo json_encode($data ? array_merge(['status'=>'success'], $data) : ['status'=>'error','message'=>'Student not found']);
             break;
 
-        // ── UPDATE student → real students table + upsert parents ───────────
+        // ========== UPDATE student ==========
         case 'update_profile':
             $id = $_POST['id'] ?? 0;
             if (!$id) { echo json_encode(['status'=>'error','message'=>'Student ID required']); exit; }
-
             $pdo->beginTransaction();
             try {
-                $pdo->prepare(
-                    "UPDATE students SET full_name=?, gender=?, course=?, year_level=?, contact=?, email=? WHERE id=?"
-                )->execute([
-                    $_POST['full_name'], $_POST['gender'], $_POST['course'],
-                    $_POST['year_level'], $_POST['contact'], $_POST['email'], $id
-                ]);
-
-                // upsert the parent row
+                $pdo->prepare("UPDATE students SET full_name=?, gender=?, course=?, year_level=?, contact=?, email=? WHERE id=?")
+                    ->execute([$_POST['full_name'], $_POST['gender'], $_POST['course'], $_POST['year_level'], $_POST['contact'], $_POST['email'], $id]);
                 $exists = $pdo->prepare("SELECT parent_id FROM parents WHERE student_id=? LIMIT 1");
                 $exists->execute([$id]);
                 if ($exists->fetchColumn()) {
@@ -155,7 +180,7 @@ try {
             }
             break;
 
-        // ── DELETE student → real table; parents + enrollment cascade ───────
+        // ========== DELETE student ==========
         case 'delete_student':
             $id = $_POST['id'] ?? 0;
             if (!$id) { echo json_encode(['status'=>'error','message'=>'Student ID required']); exit; }
@@ -163,9 +188,9 @@ try {
             echo json_encode(['status'=>'success','message'=>'Student deleted successfully']);
             break;
 
-        // ── Teacher actions (need profiles_compat.sql columns: name/subject/email) ─
+        // ========== TEACHER ACTIONS ==========
         case 'get_teachers':
-            $stmt = $pdo->query("SELECT id, name, subject, email, contact, profile_picture, bio, age, address FROM teachers ORDER BY name");
+            $stmt = $pdo->query("SELECT id, name, subject, email, contact, profile_picture, bio, age, address, teacher_number FROM teachers ORDER BY name");
             echo json_encode($stmt->fetchAll());
             break;
 
@@ -179,13 +204,53 @@ try {
             break;
 
         case 'add_teacher':
-            if (empty($_POST['name']) || empty($_POST['subject'])) {
-                echo json_encode(['status'=>'error','message'=>'Name and Subject are required']); exit;
+            $requiredFields = ['name', 'subject', 'email', 'contact', 'age', 'address'];
+            foreach ($requiredFields as $field) {
+                if (empty(trim($_POST[$field] ?? ''))) {
+                    echo json_encode(['status'=>'error','message'=>"$field is required"]);
+                    exit;
+                }
             }
-            $stmt = $pdo->prepare("INSERT INTO teachers (name, subject, email, contact, profile_picture, bio, age, address) VALUES (?,?,?,?,?,?,?,?)");
+            if (!filter_var(trim($_POST['email']), FILTER_VALIDATE_EMAIL)) {
+                echo json_encode(['status'=>'error','message'=>'Invalid email format']);
+                exit;
+            }
+            if (!is_numeric(trim($_POST['age']))) {
+                echo json_encode(['status'=>'error','message'=>'Age must be a number']);
+                exit;
+            }
+
+            $name = trim($_POST['name']);
+            $email = trim($_POST['email']);
+
+            $check = $pdo->prepare("SELECT id FROM teachers WHERE LOWER(name) = LOWER(?) OR LOWER(email) = LOWER(?)");
+            $check->execute([$name, $email]);
+            if ($check->fetch()) {
+                echo json_encode(['status'=>'error','message'=>'Teacher already exists (same name or email)']);
+                exit;
+            }
+
+            try {
+                $profilePicturePath = handleTeacherImageUpload('');
+            } catch (Exception $e) {
+                echo json_encode(['status'=>'error','message'=>$e->getMessage()]);
+                exit;
+            }
+
+            $stmt = $pdo->prepare(
+                "INSERT INTO teachers (name, subject, email, contact, profile_picture, bio, age, address, teacher_number)
+                 VALUES (?,?,?,?,?,?,?,?,?)"
+            );
             $stmt->execute([
-                $_POST['name'], $_POST['subject'], $_POST['email'] ?? '', $_POST['contact'] ?? '',
-                $_POST['profile_picture'] ?? '', $_POST['bio'] ?? '', $_POST['age'] ?: null, $_POST['address'] ?? ''
+                $name,
+                trim($_POST['subject']),
+                $email,
+                trim($_POST['contact']),
+                $profilePicturePath,
+                trim($_POST['bio'] ?? ''),
+                trim($_POST['age']),
+                trim($_POST['address']),
+                trim($_POST['teacher_number'] ?? '')
             ]);
             echo json_encode(['status'=>'success','message'=>'Teacher added']);
             break;
@@ -193,10 +258,59 @@ try {
         case 'update_teacher':
             $id = $_POST['id'] ?? 0;
             if (!$id) { echo json_encode(['status'=>'error','message'=>'Teacher ID required']); exit; }
-            $stmt = $pdo->prepare("UPDATE teachers SET name=?, subject=?, email=?, contact=?, profile_picture=?, bio=?, age=?, address=? WHERE id=?");
+
+            $requiredFields = ['name', 'subject', 'email', 'contact', 'age', 'address'];
+            foreach ($requiredFields as $field) {
+                if (empty(trim($_POST[$field] ?? ''))) {
+                    echo json_encode(['status'=>'error','message'=>"$field is required"]);
+                    exit;
+                }
+            }
+            if (!filter_var(trim($_POST['email']), FILTER_VALIDATE_EMAIL)) {
+                echo json_encode(['status'=>'error','message'=>'Invalid email format']);
+                exit;
+            }
+            if (!is_numeric(trim($_POST['age']))) {
+                echo json_encode(['status'=>'error','message'=>'Age must be a number']);
+                exit;
+            }
+
+            $name = trim($_POST['name']);
+            $email = trim($_POST['email']);
+
+            $check = $pdo->prepare("SELECT id FROM teachers WHERE (LOWER(name) = LOWER(?) OR LOWER(email) = LOWER(?)) AND id != ?");
+            $check->execute([$name, $email, $id]);
+            if ($check->fetch()) {
+                echo json_encode(['status'=>'error','message'=>'Teacher already exists (same name or email)']);
+                exit;
+            }
+
+            $stmt = $pdo->prepare("SELECT profile_picture FROM teachers WHERE id = ?");
+            $stmt->execute([$id]);
+            $existingPicture = $stmt->fetchColumn();
+
+            try {
+                $newPicture = handleTeacherImageUpload($existingPicture ?: '');
+            } catch (Exception $e) {
+                echo json_encode(['status'=>'error','message'=>$e->getMessage()]);
+                exit;
+            }
+
+            $stmt = $pdo->prepare(
+                "UPDATE teachers SET name=?, subject=?, email=?, contact=?, profile_picture=?, bio=?, age=?, address=?, teacher_number=?
+                 WHERE id=?"
+            );
             $stmt->execute([
-                $_POST['name'], $_POST['subject'], $_POST['email'] ?? '', $_POST['contact'] ?? '',
-                $_POST['profile_picture'] ?? '', $_POST['bio'] ?? '', $_POST['age'] ?: null, $_POST['address'] ?? '', $id
+                $name,
+                trim($_POST['subject']),
+                $email,
+                trim($_POST['contact']),
+                $newPicture,
+                trim($_POST['bio'] ?? ''),
+                trim($_POST['age']),
+                trim($_POST['address']),
+                trim($_POST['teacher_number'] ?? ''),
+                $id
             ]);
             echo json_encode(['status'=>'success','message'=>'Teacher updated']);
             break;
@@ -215,3 +329,4 @@ try {
     error_log("CRUD Error: " . $e->getMessage());
     echo json_encode(['status'=>'error','message'=>'Server error: '.$e->getMessage()]);
 }
+?>

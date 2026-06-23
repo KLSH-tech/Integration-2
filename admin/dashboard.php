@@ -14,7 +14,6 @@ require_admin();             // now = requireRole('admin','super_admin')
 <body>
 <?php require_once __DIR__ . '/../includes/nav.php'; renderNav('dashboard'); ?>
   <div class="app">
-    <?php render_sidebar('dashboard'); ?>
     <main class="main">
       <?php render_topbar('Dashboard'); ?>
       <section class="cards">

@@ -44,7 +44,7 @@ if (!function_exists('renderNav')) {
         ?>
         <nav class="gnav" id="gnav">
           <a class="gnav-brand" href="<?php echo e($items['scanner'][1]); ?>">
-            SCAN<span>TRACK</span>
+            Attendance <span>System</span>
           </a>
 
           <button class="gnav-toggle" type="button" aria-label="Toggle menu"

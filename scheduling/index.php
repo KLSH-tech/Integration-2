@@ -2,7 +2,7 @@
 require_once '../includes/auth.php';
 require_once '../includes/helpers.php';
 
-requireRole('admin'); // or teacher/student
+requireRole('super_admin'); // or teacher/student
 
 $pdo = db();
 ?>

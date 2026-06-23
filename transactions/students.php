@@ -21,7 +21,6 @@ $subjects = $pdo->query("
     INNER JOIN subjects sub ON sub.course_code = c.course_code
     LEFT JOIN schedules sched ON sched.class_id = c.class_id
     LEFT JOIN teachers t ON t.id = c.teacher_id
-    WHERE c.class_code != 'A28'
     GROUP BY c.class_id
     ORDER BY sub.subject_name
 ")->fetchAll();
@@ -82,9 +81,9 @@ include 'layout.php';
     </div>
 </div>
 
-<div class="two-column-layout" style="display: flex; gap: 24px;">
+<div class="two-column-layout">
     <!-- Left Sidebar: Subject List -->
-    <div class="subject-sidebar" style="width: 320px; flex-shrink: 0;">
+    <div class="subject-sidebar">
         <div class="card">
             <div class="card-header">
                 <h3>📚 Subjects</h3>
@@ -113,13 +112,16 @@ include 'layout.php';
                     </div>
                     <div class="subject-teacher">
                         <small>👨‍🏫 <strong>Instructor:</strong> 
-                            <?php if (!empty($subject['teacher_id'])): ?>
+                            <?php 
+                            // FIX: Show "Not assigned" if instructor name is empty or null
+                            $instructorName = trim($subject['instructor_name'] ?? '');
+                            if (!empty($subject['teacher_id']) && $instructorName !== ''): ?>
                                 <a href="instructor_record.php?id=<?php echo $subject['teacher_id']; ?>" 
                                    style="color: var(--accent); text-decoration: none;">
-                                    <?php echo htmlspecialchars($subject['instructor_name'] ?? 'Not assigned'); ?>
+                                    <?php echo htmlspecialchars($instructorName); ?>
                                 </a>
                             <?php else: ?>
-                                <?php echo htmlspecialchars($subject['instructor_name'] ?? 'Not assigned'); ?>
+                                <span style="color: var(--muted);">Not assigned</span>
                             <?php endif; ?>
                         </small>
                     </div>
@@ -130,7 +132,7 @@ include 'layout.php';
     </div>
 
     <!-- Right Content: Student List -->
-    <div class="student-content" style="flex: 1;">
+    <div class="student-content">
         <?php if ($selectedClass && $classInfo): ?>
             <div class="card">
                 <div class="card-header">
@@ -142,13 +144,15 @@ include 'layout.php';
                         </p>
                         <p style="margin-top: 5px; color: var(--accent);">
                             👨‍🏫 <strong>Instructor:</strong> 
-                            <?php if (!empty($classInfo['teacher_id'])): ?>
+                            <?php 
+                            $instructorName = trim($classInfo['instructor_name'] ?? '');
+                            if (!empty($classInfo['teacher_id']) && $instructorName !== ''): ?>
                                 <a href="instructor_record.php?id=<?php echo $classInfo['teacher_id']; ?>" 
                                    style="color: var(--accent); text-decoration: none;">
-                                    <?php echo htmlspecialchars($classInfo['instructor_name'] ?? 'Not assigned'); ?>
+                                    <?php echo htmlspecialchars($instructorName); ?>
                                 </a>
                             <?php else: ?>
-                                <?php echo htmlspecialchars($classInfo['instructor_name'] ?? 'Not assigned'); ?>
+                                <span style="color: var(--muted);">Not assigned</span>
                             <?php endif; ?>
                             <?php if ($classInfo['teacher_number']): ?>
                                 (<?php echo htmlspecialchars($classInfo['teacher_number']); ?>)
@@ -191,22 +195,22 @@ include 'layout.php';
                                 $statusText = $student['today_status'] ?? 'Not Recorded';
                             ?>
                             <tr>
-                                <td><?php echo $index + 1; ?></td>
-                                <td class="mono"><?php echo htmlspecialchars($student['student_number']); ?></td>
-                                <td>
+                                <td data-label="#"><?php echo $index + 1; ?></td>
+                                <td data-label="Student Number" class="mono"><?php echo htmlspecialchars($student['student_number']); ?></td>
+                                <td data-label="Full Name">
                                     <strong><?php echo htmlspecialchars($student['full_name']); ?></strong>
                                     <?php if ($student['email']): ?>
                                         <br><small><?php echo htmlspecialchars($student['email']); ?></small>
                                     <?php endif; ?>
-                                </td
-                                <td><?php echo htmlspecialchars($student['course']); ?></td
-                                <td><?php echo $student['year_level']; ?></td
-                                <td>
+                                </td>
+                                <td data-label="Course"><?php echo htmlspecialchars($student['course']); ?></td>
+                                <td data-label="Year Level"><?php echo $student['year_level']; ?></td>
+                                <td data-label="Today's Status">
                                     <span class="badge <?php echo $statusClass; ?>"><?php echo $statusText; ?></span>
-                                </td
-                                <td>
+                                </td>
+                                <td data-label="Action">
                                     <a href="student-record.php?id=<?php echo $student['id']; ?>" class="btn btn-sm btn-primary">View Record</a>
-                                </td
+                                </td>
                             </tr>
                             <?php endforeach; ?>
                         </tbody>
@@ -227,6 +231,20 @@ include 'layout.php';
 </div>
 
 <style>
+/* Layout */
+.two-column-layout {
+    display: flex;
+    gap: 24px;
+    flex-wrap: wrap;
+}
+.subject-sidebar {
+    width: 320px;
+    flex-shrink: 0;
+}
+.student-content {
+    flex: 1;
+    min-width: 0;
+}
 .subject-list {
     display: flex;
     flex-direction: column;
@@ -281,14 +299,57 @@ include 'layout.php';
 }
 .student-table th,
 .student-table td {
-    padding: 10px 12px;
-    border-bottom: 1px solid var(--border);
+    padding: 12px 15px;
     text-align: left;
+    border-bottom: 1px solid var(--border);
     vertical-align: middle;
 }
 .student-table th {
     background: var(--dark);
     color: white;
+    font-weight: 600;
+    font-size: 0.9rem;
+}
+.student-table tbody tr:hover {
+    background: var(--bg-subtle);
+}
+.mono {
+    font-family: 'Courier New', monospace;
+    font-size: 0.9em;
+}
+.badge {
+    display: inline-block;
+    padding: 4px 10px;
+    border-radius: 20px;
+    font-size: 12px;
+    font-weight: 500;
+}
+.badge-present {
+    background: #d4edda;
+    color: #155724;
+}
+.badge-late {
+    background: #fff3cd;
+    color: #856404;
+}
+.badge-absent {
+    background: #f8d7da;
+    color: #721c24;
+}
+.badge-default {
+    background: #e2e3e5;
+    color: #383d41;
+}
+.btn {
+    display: inline-block;
+    padding: 6px 12px;
+    border-radius: 4px;
+    text-decoration: none;
+    font-size: 12px;
+    transition: 0.2s;
+}
+.btn-sm {
+    padding: 4px 8px;
 }
 .btn-primary {
     background: var(--accent);
@@ -296,6 +357,66 @@ include 'layout.php';
 }
 .btn-primary:hover {
     background: var(--accent-dark);
+}
+.empty-state {
+    text-align: center;
+    padding: 60px 20px;
+}
+.empty-icon {
+    font-size: 64px;
+    margin-bottom: 20px;
+    opacity: 0.6;
+}
+.empty-state h4 {
+    margin-bottom: 10px;
+    color: var(--dark);
+}
+.empty-state p {
+    color: var(--muted);
+}
+/* Responsive */
+@media (max-width: 768px) {
+    .two-column-layout {
+        flex-direction: column;
+    }
+    .subject-sidebar {
+        width: 100%;
+    }
+    .table-wrap {
+        overflow-x: auto;
+    }
+    .student-table th,
+    .student-table td {
+        white-space: nowrap;
+    }
+}
+@media (max-width: 480px) {
+    .student-table thead {
+        display: none;
+    }
+    .student-table tbody tr {
+        display: block;
+        margin-bottom: 1rem;
+        border: 1px solid var(--border);
+        border-radius: 8px;
+    }
+    .student-table td {
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        padding: 10px;
+        border-bottom: 1px solid var(--border);
+        white-space: normal;
+    }
+    .student-table td::before {
+        content: attr(data-label);
+        font-weight: bold;
+        width: 40%;
+        color: var(--dark);
+    }
+    .student-table td:last-child {
+        border-bottom: none;
+    }
 }
 </style>
 

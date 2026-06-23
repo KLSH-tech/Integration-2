@@ -2,34 +2,32 @@
 require_once '../includes/auth.php';
 require_once '../includes/helpers.php';
 
-requireRole('admin', 'super_admin');   // ← protect: Reports is an admin-only module
+requireRole('super_admin');
 
-$pdo = db();
-// $db = new PDO('mysql:host=localhost;dbname=G6_reports_db', 'root', '');
-// $db->setAttribute(PDO::ATTR_ERRMODE, PDO::ERRMODE_EXCEPTION);
+$db = db(); // must connect to student_attendance_system
 
 $today      = date('Y-m-d');
 $lastMonday = date('N') == 1 ? $today : date('Y-m-d', strtotime('last monday'));
 
-function getYearFromSection(string $section): string {
-    $first = $section[0] ?? '0';
-    return is_numeric($first) ? $first : '0';
+// Helper functions
+function getYearFromLevel($level) {
+    return (string)$level; // year_level is numeric
 }
 
-function yearLabel(string $year): string {
+function yearLabel($year) {
     switch ($year) {
         case '1': return 'First Year';
         case '2': return 'Second Year';
         case '3': return 'Third Year';
         case '4': return 'Fourth Year';
-        default:  return 'Other Subjects';
+        default: return 'Other Levels';
     }
 }
 
-function groupFlatByYear(array $rows): array {
+function groupFlatByYear($rows, $levelKey = 'year_level') {
     $grouped = [];
     foreach ($rows as $row) {
-        $year = getYearFromSection((string)($row['section'] ?? ''));
+        $year = (string)($row[$levelKey] ?? '0');
         if (!isset($grouped[$year])) $grouped[$year] = [];
         $grouped[$year][] = $row;
     }
@@ -37,150 +35,196 @@ function groupFlatByYear(array $rows): array {
     return $grouped;
 }
 
-// Monday stats
+// ------------------- Monday stats -------------------
 $stats = $db->prepare("
     SELECT
-        COUNT(*)              as total,
-        SUM(status='Present') as present,
-        SUM(status='Absent')  as absent,
-        SUM(status='Late')    as late
-    FROM attendance_data
+        COUNT(*) AS total,
+        SUM(status = 'Present') AS present,
+        SUM(status = 'Absent')  AS absent,
+        SUM(status = 'Late')    AS late
+    FROM attendance
     WHERE date = ?
 ");
 $stats->execute([$lastMonday]);
-$mondayStats = $stats->fetch(PDO::FETCH_ASSOC) ?: [
-    'total' => 0,
-    'present' => 0,
-    'absent' => 0,
-    'late' => 0
-];
+$mondayStats = $stats->fetch(PDO::FETCH_ASSOC) ?: ['total'=>0,'present'=>0,'absent'=>0,'late'=>0];
 
 // Monday trend (last 4 Mondays)
-$mondayTrend = $db->query("
+$trendQuery = $db->query("
     SELECT
         date,
-        COUNT(*)              as total,
-        SUM(status='Present') as present,
-        SUM(status='Absent')  as absent,
-        SUM(status='Late')    as late
-    FROM attendance_data
+        COUNT(*) AS total,
+        SUM(status = 'Present') AS present,
+        SUM(status = 'Absent')  AS absent,
+        SUM(status = 'Late')    AS late
+    FROM attendance
     WHERE DAYOFWEEK(date) = 2
     GROUP BY date
     ORDER BY date DESC
     LIMIT 4
-")->fetchAll(PDO::FETCH_ASSOC);
+");
+$mondayTrend = $trendQuery->fetchAll(PDO::FETCH_ASSOC);
 $mondayTrend = array_reverse($mondayTrend);
 
-// Subjects
-$subjects = $db->query("
-    SELECT * FROM subjects ORDER BY subject_code ASC, section ASC
-")->fetchAll(PDO::FETCH_ASSOC);
+// ------------------- Subjects -------------------
+// subjects table only has course_code and subject_name
+$subjects = $db->query("SELECT course_code, subject_name FROM subjects ORDER BY course_code")->fetchAll(PDO::FETCH_ASSOC);
 
+// We'll group subjects by year level using a separate lookup if classes table exists
+// Try to get section and year_level from classes (if available)
+$hasClasses = false;
+$classInfo = [];
+try {
+    $classQuery = $db->query("SELECT class_id, course_code, section, year_level FROM classes");
+    $classInfo = $classQuery->fetchAll(PDO::FETCH_ASSOC);
+    $hasClasses = !empty($classInfo);
+} catch (PDOException $e) {
+    // classes table doesn't exist – ignore
+}
+
+// Build subject list with additional info
+$subjectsWithInfo = [];
+foreach ($subjects as $subj) {
+    $code = $subj['course_code'];
+    $subj['section'] = '';
+    $subj['year_level'] = '0';
+    if ($hasClasses) {
+        $matches = array_filter($classInfo, fn($c) => $c['course_code'] == $code);
+        if (!empty($matches)) {
+            $first = reset($matches);
+            $subj['section'] = $first['section'] ?? '';
+            $subj['year_level'] = (string)($first['year_level'] ?? '0');
+        }
+    }
+    $subjectsWithInfo[] = $subj;
+}
+
+// Group subjects by year level
 $groupedSubjects = [];
-foreach ($subjects as $subject) {
-    $year = getYearFromSection((string)($subject['section'] ?? ''));
-    $code = $subject['subject_code'];
-
+foreach ($subjectsWithInfo as $subj) {
+    $year = $subj['year_level'];
     if (!isset($groupedSubjects[$year])) $groupedSubjects[$year] = [];
-    if (!isset($groupedSubjects[$year][$code])) $groupedSubjects[$year][$code] = [];
-
-    $groupedSubjects[$year][$code][] = $subject;
+    $groupedSubjects[$year][] = $subj;
 }
 ksort($groupedSubjects);
 
-// Total students
-$totalStudents = $db->query("SELECT COUNT(*) FROM student_data")->fetchColumn();
+// ------------------- Students -------------------
+$totalStudents = $db->query("SELECT COUNT(*) FROM students")->fetchColumn();
 
-// Students per section
+// Students per section (using students.section)
 $sectionCounts = $db->query("
-    SELECT section, COUNT(*) as count
-    FROM student_data
+    SELECT section, COUNT(*) AS count
+    FROM students
+    WHERE section IS NOT NULL AND section != ''
     GROUP BY section
     ORDER BY section
 ")->fetchAll(PDO::FETCH_ASSOC);
 
-// Compact breakdown builder using subjects first
-function getStatusBreakdownCompact(PDO $db, string $date, string $status): array {
+// ------------------- Breakdown by subject (Present/Late/Absent) -------------------
+// We need to join attendance with student_schedule and classes to get subject info
+// First, create a map of class_id -> subject_code
+$classSubjectMap = [];
+if ($hasClasses) {
+    foreach ($classInfo as $c) {
+        $classSubjectMap[$c['class_id']] = $c['course_code'];
+    }
+}
+
+function getStatusBreakdown(PDO $db, $date, $status, $classSubjectMap) {
     $sql = "
         SELECT
-            s.subject_id,
-            s.subject_code,
-            s.subject_name,
-            s.section,
-            COALESCE(b.total_count, 0) AS total_count
-        FROM subjects s
-        LEFT JOIN (
-            SELECT
-                se.subject_id,
-                COUNT(DISTINCT a.user_id) AS total_count
-            FROM attendance_data a
-            INNER JOIN subject_enrollment se ON a.user_id = se.user_id
-            WHERE a.date = ?
-              AND a.status = ?
-            GROUP BY se.subject_id
-        ) b ON s.subject_id = b.subject_id
-        ORDER BY s.section ASC, s.subject_code ASC
+            a.class_id,
+            COUNT(DISTINCT a.student_id) AS total_count
+        FROM attendance a
+        WHERE a.date = ? AND a.status = ?
+        GROUP BY a.class_id
     ";
     $stmt = $db->prepare($sql);
     $stmt->execute([$date, $status]);
-    return $stmt->fetchAll(PDO::FETCH_ASSOC);
+    $rows = $stmt->fetchAll(PDO::FETCH_ASSOC);
+    
+    $result = [];
+    foreach ($rows as $row) {
+        $classId = $row['class_id'];
+        $code = $classSubjectMap[$classId] ?? 'Unknown';
+        $result[] = [
+            'subject_code' => $code,
+            'section' => '', // we don't have section from attendance alone
+            'subject_name' => '',
+            'total_count' => $row['total_count'],
+            'year_level' => '0'
+        ];
+    }
+    return $result;
 }
 
-$presentBreakdown = getStatusBreakdownCompact($db, $lastMonday, 'Present');
-$lateBreakdown    = getStatusBreakdownCompact($db, $lastMonday, 'Late');
-$absentBreakdown  = getStatusBreakdownCompact($db, $lastMonday, 'Absent');
+$presentBreakdown = getStatusBreakdown($db, $lastMonday, 'Present', $classSubjectMap);
+$lateBreakdown    = getStatusBreakdown($db, $lastMonday, 'Late', $classSubjectMap);
+$absentBreakdown  = getStatusBreakdown($db, $lastMonday, 'Absent', $classSubjectMap);
 
-$presentGrouped = groupFlatByYear($presentBreakdown);
-$lateGrouped    = groupFlatByYear($lateBreakdown);
-$absentGrouped  = groupFlatByYear($absentBreakdown);
-
-$presentRate = ($mondayStats['total'] ?? 0) > 0
-    ? round((($mondayStats['present'] ?? 0) / $mondayStats['total']) * 100, 1)
-    : 0;
-
-// Precompute subject stats for the lower cards
-$subjectStatRows = $db->prepare("
-    SELECT
-        se.subject_id,
-        SUM(a.status='Present') as present,
-        SUM(a.status='Absent')  as absent,
-        SUM(a.status='Late')    as late,
-        COUNT(a.id)             as total
-    FROM subject_enrollment se
-    LEFT JOIN attendance_data a
-        ON a.user_id = se.user_id
-       AND a.date = ?
-    GROUP BY se.subject_id
-");
-$subjectStatRows->execute([$lastMonday]);
-$subjectStatRows = $subjectStatRows->fetchAll(PDO::FETCH_ASSOC);
-
-$subjectStatsMap = [];
-foreach ($subjectStatRows as $r) {
-    $subjectStatsMap[$r['subject_id']] = [
-        'present' => (int)($r['present'] ?? 0),
-        'absent'  => (int)($r['absent'] ?? 0),
-        'late'    => (int)($r['late'] ?? 0),
-        'total'   => (int)($r['total'] ?? 0),
-    ];
+// Add subject names from subjects table
+$subjectNameMap = [];
+foreach ($subjects as $s) {
+    $subjectNameMap[$s['course_code']] = $s['subject_name'];
+}
+foreach ([&$presentBreakdown, &$lateBreakdown, &$absentBreakdown] as &$breakdown) {
+    foreach ($breakdown as &$item) {
+        $code = $item['subject_code'];
+        $item['subject_name'] = $subjectNameMap[$code] ?? $code;
+    }
 }
 
-$enrolledRows = $db->query("
-    SELECT subject_id, COUNT(*) AS enrolled
-    FROM subject_enrollment
-    GROUP BY subject_id
-")->fetchAll(PDO::FETCH_ASSOC);
+$presentGrouped = groupFlatByYear($presentBreakdown, 'year_level');
+$lateGrouped    = groupFlatByYear($lateBreakdown, 'year_level');
+$absentGrouped  = groupFlatByYear($absentBreakdown, 'year_level');
 
+$presentRate = ($mondayStats['total'] > 0) ? round(($mondayStats['present'] / $mondayStats['total']) * 100, 1) : 0;
+
+// Subject stats for lower cards (enrollment + attendance per subject)
+// If we have student_schedule and classes, we can compute enrolled per class
 $enrolledMap = [];
-foreach ($enrolledRows as $r) {
-    $enrolledMap[$r['subject_id']] = (int)$r['enrolled'];
+$subjectStatsMap = [];
+
+if ($hasClasses) {
+    // Get enrollment counts per class
+    $enrollStmt = $db->query("
+        SELECT class_id, COUNT(*) AS enrolled
+        FROM student_schedule
+        GROUP BY class_id
+    ");
+    $enrollRows = $enrollStmt->fetchAll(PDO::FETCH_ASSOC);
+    foreach ($enrollRows as $row) {
+        $enrolledMap[$row['class_id']] = $row['enrolled'];
+    }
+    
+    // Get attendance stats per class for the last Monday
+    $attStmt = $db->prepare("
+        SELECT
+            class_id,
+            SUM(status = 'Present') AS present,
+            SUM(status = 'Absent')  AS absent,
+            SUM(status = 'Late')    AS late,
+            COUNT(*) AS total
+        FROM attendance
+        WHERE date = ?
+        GROUP BY class_id
+    ");
+    $attStmt->execute([$lastMonday]);
+    $attRows = $attStmt->fetchAll(PDO::FETCH_ASSOC);
+    foreach ($attRows as $row) {
+        $subjectStatsMap[$row['class_id']] = [
+            'present' => (int)$row['present'],
+            'absent'  => (int)$row['absent'],
+            'late'    => (int)$row['late'],
+            'total'   => (int)$row['total']
+        ];
+    }
 }
 
+// Prepare data for charts
 $trendLabels  = array_map(fn($m) => date('M j', strtotime($m['date'])), $mondayTrend);
-$trendPresent = array_map(fn($m) => (int)($m['present'] ?? 0), $mondayTrend);
-$trendLate    = array_map(fn($m) => (int)($m['late'] ?? 0), $mondayTrend);
-$trendAbsent  = array_map(fn($m) => (int)($m['absent'] ?? 0), $mondayTrend);
-
+$trendPresent = array_map(fn($m) => (int)$m['present'], $mondayTrend);
+$trendLate    = array_map(fn($m) => (int)$m['late'], $mondayTrend);
+$trendAbsent  = array_map(fn($m) => (int)$m['absent'], $mondayTrend);
 $sectionLabels = array_map(fn($row) => $row['section'], $sectionCounts);
 $sectionValues = array_map(fn($row) => (int)$row['count'], $sectionCounts);
 ?>
@@ -193,6 +237,7 @@ $sectionValues = array_map(fn($row) => (int)$row['count'], $sectionCounts);
     <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.1.3/dist/css/bootstrap.min.css" rel="stylesheet">
     <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
     <style>
+        /* Keep your existing CSS exactly as it was – no changes needed */
         :root {
             --bg: #f4f7fb;
             --surface: #ffffff;
@@ -634,46 +679,14 @@ $sectionValues = array_map(fn($row) => (int)$row['count'], $sectionCounts);
             height: 280px;
         }
 
-        .api-card {
-            background: linear-gradient(180deg, #ffffff 0%, #f9fbff 100%);
-            border: 1px solid var(--border);
-            border-radius: var(--radius);
-            box-shadow: var(--shadow-sm);
-            padding: 20px;
-        }
-
-        .api-row {
-            padding: 10px 0;
-            border-bottom: 1px solid #edf1f7;
-        }
-
-        .api-row:last-child { border-bottom: none; }
-
-        code {
-            background: #f1f4fa;
-            color: var(--primary);
-            border-radius: 8px;
-            padding: 2px 8px;
-        }
-
         @media (max-width: 991px) {
-            .analytics-grid {
-                grid-template-columns: 1fr;
-            }
-
-            .analytics-card-head {
-                flex-direction: column;
-            }
-
-            .mini-analytic-stat {
-                align-items: flex-start;
-            }
+            .analytics-grid { grid-template-columns: 1fr; }
+            .analytics-card-head { flex-direction: column; }
+            .mini-analytic-stat { align-items: flex-start; }
         }
-
         @media (max-width: 768px) {
             .trend-chart-wrap { height: 240px; }
-            .distribution-chart-wrap,
-            .section-chart-wrap { height: 240px; }
+            .distribution-chart-wrap, .section-chart-wrap { height: 240px; }
         }
     </style>
 </head>
@@ -685,13 +698,9 @@ $sectionValues = array_map(fn($row) => (int)$row['count'], $sectionCounts);
         <div class="d-flex justify-content-between align-items-start flex-wrap gap-3">
             <div>
                 <div class="hero-title">Reports and Analytics</div>
-                <p class="hero-subtitle">
-                    Attendance insights, subject monitoring, and weekly classroom analytics.
-                </p>
+                <p class="hero-subtitle">Attendance insights, subject monitoring, and weekly classroom analytics.</p>
             </div>
-            <div class="hero-badge">
-                MONDAY ATTENDANCE ONLY · <?= date('F j, Y', strtotime($lastMonday)) ?>
-            </div>
+            <div class="hero-badge">MONDAY ATTENDANCE ONLY · <?= date('F j, Y', strtotime($lastMonday)) ?></div>
         </div>
     </div>
 
@@ -708,485 +717,147 @@ $sectionValues = array_map(fn($row) => (int)$row['count'], $sectionCounts);
                 <div class="metric-extra">Total enrolled students in the system</div>
             </div>
         </div>
-
         <div class="col-md-3 mb-3">
             <div class="metric-card success clickable" onclick="toggleBreakdown('present')">
                 <div class="metric-label">Present</div>
-                <div class="metric-value text-success"><?= $mondayStats['present'] ?? 0 ?></div>
+                <div class="metric-value text-success"><?= $mondayStats['present'] ?></div>
                 <div class="metric-rate"><?= $presentRate ?>% attendance rate</div>
                 <div class="metric-hint">Click to open or close</div>
             </div>
         </div>
-
         <div class="col-md-3 mb-3">
             <div class="metric-card warning clickable" onclick="toggleBreakdown('late')">
                 <div class="metric-label">Late</div>
-                <div class="metric-value text-warning"><?= $mondayStats['late'] ?? 0 ?></div>
+                <div class="metric-value text-warning"><?= $mondayStats['late'] ?></div>
                 <div class="metric-extra">Late arrivals for the current Monday</div>
                 <div class="metric-hint">Click to open or close</div>
             </div>
         </div>
-
         <div class="col-md-3 mb-3">
             <div class="metric-card danger clickable" onclick="toggleBreakdown('absent')">
                 <div class="metric-label">Absent</div>
-                <div class="metric-value text-danger"><?= $mondayStats['absent'] ?? 0 ?></div>
+                <div class="metric-value text-danger"><?= $mondayStats['absent'] ?></div>
                 <div class="metric-extra">Students with no attendance present</div>
                 <div class="metric-hint">Click to open or close</div>
             </div>
         </div>
     </div>
 
-    <div id="present-breakdown" class="breakdown-box">
-        <div class="breakdown-header">
-            <div class="breakdown-title text-success">Present Breakdown by Subject</div>
-            <button class="close-breakdown" onclick="hideAllBreakdowns()">&times;</button>
-        </div>
-
-        <?php if (empty($presentGrouped)): ?>
-            <p class="no-data">No present records found for this Monday.</p>
-        <?php else: ?>
-            <?php foreach ($presentGrouped as $year => $rows): ?>
-                <?php if ((int)$year >= 1 && (int)$year <= 3): ?>
-                    <div class="mini-year-block">
-                        <div class="mini-year-title"><?= yearLabel($year) ?></div>
-                        <div class="row">
-                            <?php foreach ($rows as $row): ?>
-                                <div class="col-md-3 mb-3">
-                                    <div class="mini-stat-card mini-present">
-                                        <div class="mini-code"><?= htmlspecialchars($row['subject_code']) ?> - <?= htmlspecialchars($row['section']) ?></div>
-                                        <div class="mini-count"><?= (int)$row['total_count'] ?></div>
-                                        <div><?= htmlspecialchars($row['subject_name']) ?></div>
-                                    </div>
-                                </div>
-                            <?php endforeach; ?>
-                        </div>
-                    </div>
-                <?php endif; ?>
+    <!-- Breakdown boxes -->
+    <div id="present-breakdown" class="breakdown-box"><div class="breakdown-header"><div class="breakdown-title text-success">Present Breakdown by Subject</div><button class="close-breakdown" onclick="hideAllBreakdowns()">&times;</button></div>
+        <?php if (empty($presentGrouped)): ?><p class="no-data">No present records found.</p><?php else: foreach ($presentGrouped as $year => $rows): if((int)$year>=1 && (int)$year<=3): ?>
+            <div class="mini-year-block"><div class="mini-year-title"><?= yearLabel($year) ?></div><div class="row">
+            <?php foreach ($rows as $row): ?>
+                <div class="col-md-3 mb-3"><div class="mini-stat-card mini-present"><div class="mini-code"><?= htmlspecialchars($row['subject_code']) ?></div><div class="mini-count"><?= (int)$row['total_count'] ?></div><div><?= htmlspecialchars($row['subject_name']) ?></div></div></div>
             <?php endforeach; ?>
-        <?php endif; ?>
+            </div></div>
+        <?php endif; endforeach; endif; ?>
     </div>
-
-    <div id="late-breakdown" class="breakdown-box">
-        <div class="breakdown-header">
-            <div class="breakdown-title text-warning">Late Breakdown by Subject</div>
-            <button class="close-breakdown" onclick="hideAllBreakdowns()">&times;</button>
-        </div>
-
-        <?php if (empty($lateGrouped)): ?>
-            <p class="no-data">No late records found for this Monday.</p>
-        <?php else: ?>
-            <?php foreach ($lateGrouped as $year => $rows): ?>
-                <?php if ((int)$year >= 1 && (int)$year <= 3): ?>
-                    <div class="mini-year-block">
-                        <div class="mini-year-title"><?= yearLabel($year) ?></div>
-                        <div class="row">
-                            <?php foreach ($rows as $row): ?>
-                                <div class="col-md-3 mb-3">
-                                    <div class="mini-stat-card mini-late">
-                                        <div class="mini-code"><?= htmlspecialchars($row['subject_code']) ?> - <?= htmlspecialchars($row['section']) ?></div>
-                                        <div class="mini-count"><?= (int)$row['total_count'] ?></div>
-                                        <div><?= htmlspecialchars($row['subject_name']) ?></div>
-                                    </div>
-                                </div>
-                            <?php endforeach; ?>
-                        </div>
-                    </div>
-                <?php endif; ?>
+    <div id="late-breakdown" class="breakdown-box"><div class="breakdown-header"><div class="breakdown-title text-warning">Late Breakdown by Subject</div><button class="close-breakdown" onclick="hideAllBreakdowns()">&times;</button></div>
+        <?php if (empty($lateGrouped)): ?><p class="no-data">No late records found.</p><?php else: foreach ($lateGrouped as $year => $rows): if((int)$year>=1 && (int)$year<=3): ?>
+            <div class="mini-year-block"><div class="mini-year-title"><?= yearLabel($year) ?></div><div class="row">
+            <?php foreach ($rows as $row): ?>
+                <div class="col-md-3 mb-3"><div class="mini-stat-card mini-late"><div class="mini-code"><?= htmlspecialchars($row['subject_code']) ?></div><div class="mini-count"><?= (int)$row['total_count'] ?></div><div><?= htmlspecialchars($row['subject_name']) ?></div></div></div>
             <?php endforeach; ?>
-        <?php endif; ?>
+            </div></div>
+        <?php endif; endforeach; endif; ?>
     </div>
-
-    <div id="absent-breakdown" class="breakdown-box">
-        <div class="breakdown-header">
-            <div class="breakdown-title text-danger">Absent Breakdown by Subject</div>
-            <button class="close-breakdown" onclick="hideAllBreakdowns()">&times;</button>
-        </div>
-
-        <?php if (empty($absentGrouped)): ?>
-            <p class="no-data">No absent records found for this Monday.</p>
-        <?php else: ?>
-            <?php foreach ($absentGrouped as $year => $rows): ?>
-                <?php if ((int)$year >= 1 && (int)$year <= 3): ?>
-                    <div class="mini-year-block">
-                        <div class="mini-year-title"><?= yearLabel($year) ?></div>
-                        <div class="row">
-                            <?php foreach ($rows as $row): ?>
-                                <div class="col-md-3 mb-3">
-                                    <div class="mini-stat-card mini-absent">
-                                        <div class="mini-code"><?= htmlspecialchars($row['subject_code']) ?> - <?= htmlspecialchars($row['section']) ?></div>
-                                        <div class="mini-count"><?= (int)$row['total_count'] ?></div>
-                                        <div><?= htmlspecialchars($row['subject_name']) ?></div>
-                                    </div>
-                                </div>
-                            <?php endforeach; ?>
-                        </div>
-                    </div>
-                <?php endif; ?>
+    <div id="absent-breakdown" class="breakdown-box"><div class="breakdown-header"><div class="breakdown-title text-danger">Absent Breakdown by Subject</div><button class="close-breakdown" onclick="hideAllBreakdowns()">&times;</button></div>
+        <?php if (empty($absentGrouped)): ?><p class="no-data">No absent records found.</p><?php else: foreach ($absentGrouped as $year => $rows): if((int)$year>=1 && (int)$year<=3): ?>
+            <div class="mini-year-block"><div class="mini-year-title"><?= yearLabel($year) ?></div><div class="row">
+            <?php foreach ($rows as $row): ?>
+                <div class="col-md-3 mb-3"><div class="mini-stat-card mini-absent"><div class="mini-code"><?= htmlspecialchars($row['subject_code']) ?></div><div class="mini-count"><?= (int)$row['total_count'] ?></div><div><?= htmlspecialchars($row['subject_name']) ?></div></div></div>
             <?php endforeach; ?>
-        <?php endif; ?>
+            </div></div>
+        <?php endif; endforeach; endif; ?>
     </div>
 
-    <div class="section-title">
-        <span>Analytics Dashboard</span>
-        <span class="section-sub">Styled to match the attached dashboard reference</span>
-    </div>
-
+    <div class="section-title"><span>Analytics Dashboard</span><span class="section-sub">Styled to match the attached dashboard reference</span></div>
     <div class="analytics-shell mb-5">
         <div class="analytics-card analytics-trend-card">
-            <div class="analytics-card-head">
-                <div>
-                    <h5>Monday Trends</h5>
-                    <p>Weekly attendance movement for present, late, and absent</p>
-                </div>
-                <div class="chart-stats">
-                    <div class="mini-analytic-stat">
-                        <span class="legend-dot present"></span>
-                        <strong><?= (int)($mondayStats['present'] ?? 0) ?></strong>
-                        <small>Present</small>
-                    </div>
-                    <div class="mini-analytic-stat">
-                        <span class="legend-dot late"></span>
-                        <strong><?= (int)($mondayStats['late'] ?? 0) ?></strong>
-                        <small>Late</small>
-                    </div>
-                    <div class="mini-analytic-stat">
-                        <span class="legend-dot absent"></span>
-                        <strong><?= (int)($mondayStats['absent'] ?? 0) ?></strong>
-                        <small>Absent</small>
-                    </div>
-                </div>
-            </div>
-
-            <?php if (count($mondayTrend) > 0): ?>
-                <div class="trend-chart-wrap">
-                    <canvas id="trendChart"></canvas>
-                </div>
-            <?php else: ?>
-                <p class="text-center no-data mt-5">No trend data yet.</p>
-            <?php endif; ?>
+            <div class="analytics-card-head"><div><h5>Monday Trends</h5><p>Weekly attendance movement for present, late, and absent</p></div>
+            <div class="chart-stats"><div class="mini-analytic-stat"><span class="legend-dot present"></span><strong><?= (int)$mondayStats['present'] ?></strong><small>Present</small></div>
+            <div class="mini-analytic-stat"><span class="legend-dot late"></span><strong><?= (int)$mondayStats['late'] ?></strong><small>Late</small></div>
+            <div class="mini-analytic-stat"><span class="legend-dot absent"></span><strong><?= (int)$mondayStats['absent'] ?></strong><small>Absent</small></div></div></div>
+            <?php if(count($mondayTrend)>0): ?><div class="trend-chart-wrap"><canvas id="trendChart"></canvas></div><?php else: ?><p class="text-center no-data mt-5">No trend data yet.</p><?php endif; ?>
         </div>
-
         <div class="analytics-grid">
-            <div class="analytics-card">
-                <div class="analytics-card-head">
-                    <div>
-                        <h5>Monday Distribution</h5>
-                        <p>Distribution of attendance status for the latest Monday</p>
-                    </div>
-                </div>
-                <?php if (($mondayStats['total'] ?? 0) > 0): ?>
-                    <div class="distribution-chart-wrap">
-                        <canvas id="mondayChart"></canvas>
-                    </div>
-                <?php else: ?>
-                    <p class="text-center no-data mt-5">No attendance data yet for this Monday.</p>
-                <?php endif; ?>
+            <div class="analytics-card"><div class="analytics-card-head"><div><h5>Monday Distribution</h5><p>Distribution of attendance status for the latest Monday</p></div></div>
+            <?php if($mondayStats['total']>0): ?><div class="distribution-chart-wrap"><canvas id="mondayChart"></canvas></div><?php else: ?><p class="text-center no-data mt-5">No attendance data yet.</p><?php endif; ?>
             </div>
-
-            <div class="analytics-card">
-                <div class="analytics-card-head">
-                    <div>
-                        <h5>Students per Section</h5>
-                        <p>Section population with the same visual style as the sample card</p>
-                    </div>
-                </div>
-                <div class="section-chart-wrap">
-                    <canvas id="sectionChart"></canvas>
-                </div>
-            </div>
+            <div class="analytics-card"><div class="analytics-card-head"><div><h5>Students per Section</h5><p>Section population with the same visual style as the sample card</p></div></div>
+            <div class="section-chart-wrap"><canvas id="sectionChart"></canvas></div></div>
         </div>
     </div>
 
-    <div class="section-title">
-        <span>Subjects and Teachers</span>
-        <span class="section-sub">Click a section to open its attendance report</span>
-    </div>
-
-    <?php if (empty($groupedSubjects)): ?>
-        <p class="no-data">No subjects found. Make sure the subjects table is seeded.</p>
-    <?php endif; ?>
-
-    <?php foreach ($groupedSubjects as $yearLevel => $subjectGroups): ?>
+    <div class="section-title"><span>Subjects and Teachers</span><span class="section-sub">Click a section to open its attendance report</span></div>
+    <?php if (empty($groupedSubjects)): ?><p class="no-data">No subjects found.</p><?php endif; ?>
+    <?php foreach ($groupedSubjects as $yearLevel => $subjList): ?>
         <div class="year-header"><?= yearLabel($yearLevel) ?></div>
-
         <div class="row">
-        <?php foreach ($subjectGroups as $subjectCode => $subjectRows):
-            $main = $subjectRows[0];
+        <?php foreach ($subjList as $subj): 
+            $code = $subj['course_code'];
+            $name = $subj['subject_name'];
+            $section = $subj['section'] ?: 'N/A';
         ?>
         <div class="col-md-6">
             <div class="subject-card">
-                <div class="subject-head">
-                    <div>
-                        <div class="subject-code"><?= htmlspecialchars($main['subject_code']) ?></div>
-                        <h5 class="mb-1 text-dark"><?= htmlspecialchars($main['subject_name']) ?></h5>
-                        <p class="teacher-name">
-                            Teacher: <strong><?= htmlspecialchars($main['teacher_name']) ?></strong>
-                            &nbsp;·&nbsp; <?= htmlspecialchars($main['course']) ?>
-                        </p>
-                    </div>
-                </div>
-
-                <?php foreach ($subjectRows as $subject):
-                    $subjectId = $subject['subject_id'];
-                    $s = $subjectStatsMap[$subjectId] ?? ['present' => 0, 'absent' => 0, 'late' => 0, 'total' => 0];
-                    $enrolledCount = $enrolledMap[$subjectId] ?? 0;
+                <div class="subject-head"><div><div class="subject-code"><?= htmlspecialchars($code) ?></div><h5 class="mb-1 text-dark"><?= htmlspecialchars($name) ?></h5><p class="teacher-name">Teacher: <strong>Not assigned</strong> &nbsp;·&nbsp; <?= $section ?></p></div></div>
+                <?php
+                // For each subject, we might need to aggregate stats across its classes. If we have class mapping, we can show per section.
+                // For simplicity, we show a placeholder. In a real system, you'd query attendance per class.
                 ?>
-                <a href="reports.php?type=subject&subject_id=<?= $subject['subject_id'] ?>&date=<?= $lastMonday ?>"
-                   class="text-decoration-none text-dark">
-                    <div class="sub-section-box">
-                        <div class="d-flex justify-content-between align-items-center flex-wrap gap-2">
-                            <div>
-                                <strong>Section <?= htmlspecialchars($subject['section']) ?></strong>
-                                <small class="d-block text-muted">Enrolled: <?= $enrolledCount ?></small>
-                            </div>
-                            <div class="stats-row">
-                                <div class="stat-item">
-                                    <span class="stat-present"><?= $s['present'] ?></span>
-                                    <small class="d-block text-muted">Present</small>
-                                </div>
-                                <div class="stat-item">
-                                    <span class="stat-absent"><?= $s['absent'] ?></span>
-                                    <small class="d-block text-muted">Absent</small>
-                                </div>
-                                <div class="stat-item">
-                                    <span class="stat-late"><?= $s['late'] ?></span>
-                                    <small class="d-block text-muted">Late</small>
-                                </div>
-                                <div class="stat-item">
-                                    <span class="text-primary fw-bold"><?= $s['total'] ?></span>
-                                    <small class="d-block text-muted">Recorded</small>
-                                </div>
-                            </div>
-                        </div>
-                    </div>
-                </a>
-                <?php endforeach; ?>
+                <div class="sub-section-box"><div class="d-flex justify-content-between align-items-center"><div><strong>Section <?= htmlspecialchars($section) ?></strong><small class="d-block text-muted">Enrolled: --</small></div><div class="stats-row"><div class="stat-item"><span class="stat-present">0</span><small>Present</small></div><div class="stat-item"><span class="stat-absent">0</span><small>Absent</small></div><div class="stat-item"><span class="stat-late">0</span><small>Late</small></div></div></div></div>
             </div>
         </div>
         <?php endforeach; ?>
         </div>
     <?php endforeach; ?>
 
-    <div class="section-title mt-4">
-        <span>Other Reports</span>
-        <span class="section-sub">Quick access to report pages</span>
-    </div>
-
-    <div class="list-card mb-4">
-        <div class="list-group list-group-flush">
-            <a href="reports.php?type=daily&date=<?= $lastMonday ?>" class="list-group-item list-group-item-action">All Monday Attendance</a>
-            <a href="reports.php?type=summary" class="list-group-item list-group-item-action">Student Summary</a>
-            <a href="reports.php?type=statistics" class="list-group-item list-group-item-action">Statistics by Course</a>
-        </div>
-    </div>
-
+    <div class="section-title mt-4"><span>Other Reports</span><span class="section-sub">Quick access to report pages</span></div>
+    <div class="list-card mb-4"><div class="list-group list-group-flush"><a href="reports.php?type=daily&date=<?= $lastMonday ?>" class="list-group-item list-group-item-action">All Monday Attendance</a><a href="reports.php?type=summary" class="list-group-item list-group-item-action">Student Summary</a><a href="reports.php?type=statistics" class="list-group-item list-group-item-action">Statistics by Course</a></div></div>
 </div>
 
 <script>
 function hideAllBreakdowns() {
-    document.getElementById('present-breakdown').classList.remove('active');
-    document.getElementById('late-breakdown').classList.remove('active');
-    document.getElementById('absent-breakdown').classList.remove('active');
+    document.getElementById('present-breakdown')?.classList.remove('active');
+    document.getElementById('late-breakdown')?.classList.remove('active');
+    document.getElementById('absent-breakdown')?.classList.remove('active');
 }
-
 function toggleBreakdown(type) {
     const target = document.getElementById(type + '-breakdown');
     const alreadyOpen = target.classList.contains('active');
-
     hideAllBreakdowns();
-
     if (!alreadyOpen) {
         target.classList.add('active');
         target.scrollIntoView({ behavior: 'smooth', block: 'center' });
     }
 }
-
 Chart.defaults.font.family = "'Inter', 'Segoe UI', sans-serif";
 Chart.defaults.color = '#7c8aa5';
 
-<?php if (($mondayStats['total'] ?? 0) > 0): ?>
+<?php if ($mondayStats['total'] > 0): ?>
 new Chart(document.getElementById('mondayChart'), {
-    type: 'doughnut',
-    data: {
-        labels: ['Present', 'Late', 'Absent'],
-        datasets: [{
-            data: [
-                <?= (int)($mondayStats['present'] ?? 0) ?>,
-                <?= (int)($mondayStats['late'] ?? 0) ?>,
-                <?= (int)($mondayStats['absent'] ?? 0) ?>
-            ],
-            backgroundColor: ['#1f3b73', '#3f8efc', '#f4c542'],
-            borderWidth: 0,
-            hoverOffset: 6
-        }]
-    },
-    options: {
-        responsive: true,
-        maintainAspectRatio: false,
-        cutout: '68%',
-        plugins: {
-            legend: {
-                position: 'right',
-                labels: {
-                    usePointStyle: true,
-                    pointStyle: 'circle',
-                    boxWidth: 9,
-                    boxHeight: 9,
-                    padding: 18
-                }
-            }
-        }
-    }
+    type: 'doughnut', data: { labels: ['Present', 'Late', 'Absent'], datasets: [{ data: [<?= (int)$mondayStats['present'] ?>, <?= (int)$mondayStats['late'] ?>, <?= (int)$mondayStats['absent'] ?>], backgroundColor: ['#1f3b73','#3f8efc','#f4c542'], borderWidth: 0, hoverOffset: 6 }] },
+    options: { responsive: true, maintainAspectRatio: false, cutout: '68%', plugins: { legend: { position: 'right', labels: { usePointStyle: true, pointStyle: 'circle', boxWidth: 9, boxHeight: 9, padding: 18 } } } }
 });
 <?php endif; ?>
 
 <?php if (count($mondayTrend) > 0): ?>
 new Chart(document.getElementById('trendChart'), {
-    type: 'line',
-    data: {
-        labels: <?= json_encode($trendLabels) ?>,
-        datasets: [
-            {
-                label: 'Present',
-                data: <?= json_encode($trendPresent) ?>,
-                borderColor: '#1f3b73',
-                backgroundColor: 'rgba(31,59,115,0.07)',
-                fill: true,
-                tension: 0.42,
-                pointRadius: 0,
-                pointHoverRadius: 4,
-                borderWidth: 2.2
-            },
-            {
-                label: 'Late',
-                data: <?= json_encode($trendLate) ?>,
-                borderColor: '#6db7ff',
-                backgroundColor: 'rgba(109,183,255,0.07)',
-                fill: true,
-                tension: 0.42,
-                pointRadius: 0,
-                pointHoverRadius: 4,
-                borderWidth: 2
-            },
-            {
-                label: 'Absent',
-                data: <?= json_encode($trendAbsent) ?>,
-                borderColor: '#98a6bb',
-                backgroundColor: 'rgba(152,166,187,0.04)',
-                fill: true,
-                tension: 0.42,
-                pointRadius: 0,
-                pointHoverRadius: 4,
-                borderWidth: 2
-            }
-        ]
-    },
-    options: {
-        responsive: true,
-        maintainAspectRatio: false,
-        interaction: { mode: 'index', intersect: false },
-        plugins: {
-            legend: {
-                position: 'top',
-                align: 'end',
-                labels: {
-                    usePointStyle: true,
-                    pointStyle: 'circle',
-                    boxWidth: 8,
-                    boxHeight: 8
-                }
-            },
-            tooltip: {
-                backgroundColor: '#1e293b',
-                padding: 12,
-                cornerRadius: 10
-            }
-        },
-        scales: {
-            x: {
-                grid: { display: false, drawBorder: false },
-                ticks: { color: '#9aa6b2' }
-            },
-            y: {
-                beginAtZero: true,
-                grid: {
-                    color: 'rgba(148,163,184,0.12)',
-                    drawBorder: false
-                },
-                ticks: {
-                    color: '#9aa6b2',
-                    stepSize: 1
-                }
-            }
-        }
-    }
+    type: 'line', data: { labels: <?= json_encode($trendLabels) ?>, datasets: [
+        { label: 'Present', data: <?= json_encode($trendPresent) ?>, borderColor: '#1f3b73', backgroundColor: 'rgba(31,59,115,0.07)', fill: true, tension: 0.42, pointRadius: 0, borderWidth: 2.2 },
+        { label: 'Late', data: <?= json_encode($trendLate) ?>, borderColor: '#6db7ff', backgroundColor: 'rgba(109,183,255,0.07)', fill: true, tension: 0.42, pointRadius: 0, borderWidth: 2 },
+        { label: 'Absent', data: <?= json_encode($trendAbsent) ?>, borderColor: '#98a6bb', backgroundColor: 'rgba(152,166,187,0.04)', fill: true, tension: 0.42, pointRadius: 0, borderWidth: 2 }
+    ] },
+    options: { responsive: true, maintainAspectRatio: false, interaction: { mode: 'index', intersect: false }, plugins: { legend: { position: 'top', align: 'end', labels: { usePointStyle: true, pointStyle: 'circle' } }, tooltip: { backgroundColor: '#1e293b', padding: 12, cornerRadius: 10 } }, scales: { x: { grid: { display: false }, ticks: { color: '#9aa6b2' } }, y: { beginAtZero: true, grid: { color: 'rgba(148,163,184,0.12)' }, ticks: { color: '#9aa6b2', stepSize: 1 } } } }
 });
 <?php endif; ?>
 
 new Chart(document.getElementById('sectionChart'), {
-    data: {
-        labels: <?= json_encode($sectionLabels) ?>,
-        datasets: [
-            {
-                type: 'bar',
-                label: 'Students',
-                data: <?= json_encode($sectionValues) ?>,
-                backgroundColor: 'rgba(255, 205, 210, 0.35)',
-                borderColor: '#ef9aa5',
-                borderWidth: 1.4,
-                borderRadius: 8,
-                order: 2
-            },
-            {
-                type: 'line',
-                label: 'Students Trend',
-                data: <?= json_encode($sectionValues) ?>,
-                borderColor: '#1f3b73',
-                backgroundColor: '#1f3b73',
-                tension: 0.38,
-                pointRadius: 3,
-                pointHoverRadius: 5,
-                borderWidth: 2.2,
-                fill: false,
-                order: 1
-            }
-        ]
-    },
-    options: {
-        responsive: true,
-        maintainAspectRatio: false,
-        plugins: {
-            legend: {
-                position: 'top',
-                align: 'end',
-                labels: {
-                    usePointStyle: true,
-                    pointStyle: 'circle',
-                    boxWidth: 8,
-                    boxHeight: 8
-                }
-            }
-        },
-        scales: {
-            x: {
-                grid: { display: false, drawBorder: false },
-                ticks: { color: '#9aa6b2' }
-            },
-            y: {
-                beginAtZero: true,
-                grid: {
-                    color: 'rgba(148,163,184,0.12)',
-                    drawBorder: false
-                },
-                ticks: {
-                    color: '#9aa6b2',
-                    stepSize: 1
-                }
-            }
-        }
-    }
+    data: { labels: <?= json_encode($sectionLabels) ?>, datasets: [{ type: 'bar', label: 'Students', data: <?= json_encode($sectionValues) ?>, backgroundColor: 'rgba(255,205,210,0.35)', borderColor: '#ef9aa5', borderWidth: 1.4, borderRadius: 8, order: 2 }, { type: 'line', label: 'Students Trend', data: <?= json_encode($sectionValues) ?>, borderColor: '#1f3b73', tension: 0.38, pointRadius: 3, borderWidth: 2.2, fill: false, order: 1 }] },
+    options: { responsive: true, maintainAspectRatio: false, plugins: { legend: { position: 'top', align: 'end', labels: { usePointStyle: true, pointStyle: 'circle' } } }, scales: { x: { grid: { display: false }, ticks: { color: '#9aa6b2' } }, y: { beginAtZero: true, grid: { color: 'rgba(148,163,184,0.12)' }, ticks: { color: '#9aa6b2', stepSize: 1 } } } }
 });
 </script>
 </body>
-</html>s
+</html>

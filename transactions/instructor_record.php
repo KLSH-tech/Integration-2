@@ -2,10 +2,22 @@
 require_once __DIR__ . '/config.php';
 requireTeacher();
 
+// BASE_URL is already defined in config.php – DO NOT redefine it here
+
 $pdo = db();
 $teacher_id = isset($_GET['id']) ? (int)$_GET['id'] : 0;
 $date = isset($_GET['date']) ? $_GET['date'] : date('Y-m-d');
 $class_id = isset($_GET['class']) ? (int)$_GET['class'] : 0;
+
+// Helper function for status badge class
+function statusBadgeClass($status) {
+    return match($status) {
+        'Present' => 'badge-present',
+        'Late'    => 'badge-late',
+        'Absent'  => 'badge-absent',
+        default   => 'badge-default'
+    };
+}
 
 // Get teacher info
 $teacher = $pdo->prepare("
@@ -22,14 +34,21 @@ if (!$teacher) {
     exit;
 }
 
-// Get classes taught by this teacher
+// Get classes taught by this teacher (aggregated schedules – fixes duplication)
 $classes = $pdo->prepare("
-    SELECT DISTINCT c.class_id, c.course_code, sub.subject_name, c.section,
-           sched.day, sched.start_time, sched.end_time, sched.room
+    SELECT 
+        c.class_id, 
+        c.course_code, 
+        sub.subject_name, 
+        c.section,
+        GROUP_CONCAT(DISTINCT sched.day ORDER BY FIELD(sched.day, 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday') SEPARATOR ', ') as days,
+        GROUP_CONCAT(DISTINCT CONCAT(TIME_FORMAT(sched.start_time, '%h:%i %p'), ' - ', TIME_FORMAT(sched.end_time, '%h:%i %p')) SEPARATOR ', ') as time_slots,
+        GROUP_CONCAT(DISTINCT sched.room SEPARATOR ', ') as rooms
     FROM classes c
     INNER JOIN subjects sub ON sub.course_code = c.course_code
     LEFT JOIN schedules sched ON sched.class_id = c.class_id
     WHERE c.teacher_id = ?
+    GROUP BY c.class_id
     ORDER BY sub.subject_name
 ");
 $classes->execute([$teacher_id]);
@@ -40,7 +59,7 @@ if ($class_id == 0 && !empty($classes)) {
     $class_id = $classes[0]['class_id'];
 }
 
-// Get instructor attendance records for selected date (kung may data)
+// Get instructor attendance records for selected date
 $instructorAttendance = $pdo->prepare("
     SELECT * FROM attendance 
     WHERE teacher_id = ? AND date = ?
@@ -65,15 +84,21 @@ if ($class_id) {
     $studentsAttendance = $stmt->fetchAll();
 }
 
-// Get class info for current class
+// Get class info for current class (aggregated schedules)
 $classInfo = null;
 if ($class_id) {
     $stmt = $pdo->prepare("
-        SELECT c.*, sub.subject_name, sched.day, sched.start_time, sched.end_time, sched.room
+        SELECT 
+            c.*, 
+            sub.subject_name,
+            GROUP_CONCAT(DISTINCT sched.day ORDER BY FIELD(sched.day, 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday') SEPARATOR ', ') as days,
+            GROUP_CONCAT(DISTINCT CONCAT(TIME_FORMAT(sched.start_time, '%h:%i %p'), ' - ', TIME_FORMAT(sched.end_time, '%h:%i %p')) SEPARATOR ', ') as time_slots,
+            GROUP_CONCAT(DISTINCT sched.room SEPARATOR ', ') as rooms
         FROM classes c
         INNER JOIN subjects sub ON sub.course_code = c.course_code
         LEFT JOIN schedules sched ON sched.class_id = c.class_id
         WHERE c.class_id = ?
+        GROUP BY c.class_id
     ");
     $stmt->execute([$class_id]);
     $classInfo = $stmt->fetch();
@@ -86,7 +111,7 @@ include 'layout.php';
 
 <div class="page-header">
     <div>
-        <h2>👨‍🏫 <?php echo htmlspecialchars($teacher['name']); ?></h2>
+        <h2> <?php echo htmlspecialchars($teacher['name']); ?></h2>
         <p>
             <?php echo htmlspecialchars($teacher['teacher_number'] ?? ''); ?> | 
             Department: <?php echo htmlspecialchars($teacher['department'] ?? 'N/A'); ?>
@@ -105,21 +130,45 @@ include 'layout.php';
         <h3>📋 Instructor Information</h3>
     </div>
     <div class="card-body" style="padding: 20px;">
-        <div style="display: flex; gap: 30px; flex-wrap: wrap;">
-            <div><strong>Full Name:</strong><br><?php echo htmlspecialchars($teacher['name']); ?></div>
-            <div><strong>Teacher Number:</strong><br><?php echo htmlspecialchars($teacher['teacher_number'] ?? 'N/A'); ?></div>
-            <div><strong>Department:</strong><br><?php echo htmlspecialchars($teacher['department'] ?? 'N/A'); ?></div>
-            <div><strong>Email:</strong><br><?php echo htmlspecialchars($teacher['email'] ?? $teacher['user_email'] ?? 'N/A'); ?></div>
-            <div><strong>Contact:</strong><br><?php echo htmlspecialchars($teacher['contact'] ?? 'N/A'); ?></div>
+        <div style="display: flex; gap: 20px; flex-wrap: wrap;">
+           <?php
+$imageDir = __DIR__ . '/../profiles/uploads/teachers/';
+$imageUrl = BASE_URL . '/profiles/uploads/teachers/default.png';
+
+// get all teacher images
+$files = glob($imageDir . 'teacher_*');
+
+// if image exists use latest one
+if (!empty($files)) {
+
+    // newest uploaded file
+    usort($files, function($a, $b) {
+        return filemtime($b) - filemtime($a);
+    });
+
+    $latestFile = basename($files[0]);
+
+    $imageUrl = BASE_URL . '/profiles/uploads/teachers/' . $latestFile;
+}
+?>
+
+<img src="<?php echo htmlspecialchars($imageUrl); ?>"
+     style="width: 120px; height: 120px; object-fit: cover; border-radius: 50%; border: 3px solid #2a5298;">
+            <div class="info-grid" style="flex: 1;">
+                <div><strong>Full Name:</strong><br><?php echo htmlspecialchars($teacher['name']); ?></div>
+                <div><strong>Teacher Number:</strong><br><?php echo htmlspecialchars($teacher['teacher_number'] ?? 'N/A'); ?></div>
+                <div><strong>Department:</strong><br><?php echo htmlspecialchars($teacher['department'] ?? 'N/A'); ?></div>
+                <div><strong>Email:</strong><br><?php echo htmlspecialchars($teacher['email'] ?? $teacher['user_email'] ?? 'N/A'); ?></div>
+                <div><strong>Contact:</strong><br><?php echo htmlspecialchars($teacher['contact'] ?? 'N/A'); ?></div>
+            </div>
         </div>
     </div>
 </div>
 
 <!-- Two Column Layout -->
-<div class="two-column-layout" style="display: flex; gap: 24px;">
-    
+<div class="two-column-layout">
     <!-- Left: Subjects Taught -->
-    <div class="subject-sidebar" style="width: 300px; flex-shrink: 0;">
+    <div class="subject-sidebar">
         <div class="card">
             <div class="card-header">
                 <h3>📚 Subjects Taught</h3>
@@ -137,8 +186,13 @@ include 'layout.php';
                     </div>
                     <div class="subject-schedule">
                         <small>
-                            <?php echo htmlspecialchars($cls['day'] ?? 'TBA'); ?> • 
-                            <?php echo $cls['start_time'] ? date('h:i A', strtotime($cls['start_time'])) . ' - ' . date('h:i A', strtotime($cls['end_time'])) : 'TBA'; ?>
+                            <?php 
+                            if (!empty($cls['days'])) {
+                                echo htmlspecialchars($cls['days']) . ' • ' . htmlspecialchars($cls['time_slots']);
+                            } else {
+                                echo 'Schedule TBA';
+                            }
+                            ?>
                         </small>
                     </div>
                 </a>
@@ -148,12 +202,11 @@ include 'layout.php';
     </div>
 
     <!-- Right: Attendance Records -->
-    <div class="student-content" style="flex: 1;">
-        
+    <div class="student-content">
         <!-- Instructor's Own Attendance -->
         <div class="card" style="margin-bottom: 24px;">
             <div class="card-header">
-                <h3>👨‍🏫 Instructor's Attendance - <?php echo date('F j, Y', strtotime($date)); ?></h3>
+                <h3>Instructor's Attendance - <?php echo date('F j, Y', strtotime($date)); ?></h3>
             </div>
             <?php if (empty($instructorAttendance)): ?>
                 <div class="empty-state">
@@ -178,7 +231,7 @@ include 'layout.php';
                             <td class="mono"><?php echo date('M d, Y', strtotime($att['date'])); ?></td>
                             <td class="mono"><?php echo $att['time_in'] ? date('g:i A', strtotime($att['time_in'])) : '—'; ?></td>
                             <td class="mono"><?php echo $att['time_out'] ? date('g:i A', strtotime($att['time_out'])) : '—'; ?></td>
-                            <td><span class="badge <?php echo statusClass($att['status']); ?>"><?php echo $att['status']; ?></span></td>
+                            <td><span class="badge <?php echo statusBadgeClass($att['status']); ?>"><?php echo htmlspecialchars($att['status']); ?></span></td>
                         </tr>
                         <?php endforeach; ?>
                     </tbody>
@@ -196,7 +249,13 @@ include 'layout.php';
                     <p>
                         <?php echo htmlspecialchars($classInfo['course_code']); ?> | 
                         Section: <?php echo htmlspecialchars($classInfo['section']); ?> |
-                        Schedule: <?php echo $classInfo['day'] ? htmlspecialchars($classInfo['day']) . ' • ' . date('h:i A', strtotime($classInfo['start_time'])) . ' - ' . date('h:i A', strtotime($classInfo['end_time'])) : 'TBA'; ?>
+                        Schedule: <?php 
+                            if (!empty($classInfo['days'])) {
+                                echo htmlspecialchars($classInfo['days']) . ' • ' . htmlspecialchars($classInfo['time_slots']);
+                            } else {
+                                echo 'TBA';
+                            }
+                        ?>
                     </p>
                 </div>
                 <div class="student-count">
@@ -228,30 +287,24 @@ include 'layout.php';
                     </thead>
                     <tbody>
                         <?php foreach ($studentsAttendance as $index => $student): 
-                            $statusClass = match($student['status'] ?? '') {
-                                'Present' => 'badge-present',
-                                'Late' => 'badge-late',
-                                'Absent' => 'badge-absent',
-                                default => 'badge-default'
-                            };
                             $statusText = $student['status'] ?? 'Not Recorded';
                         ?>
                         <tr>
-                            <td><?php echo $index + 1; ?></td>
-                            <td class="mono"><?php echo htmlspecialchars($student['student_number']); ?></td>
-                            <td>
+                            <td data-label="#"><?php echo $index + 1; ?></td>
+                            <td data-label="Student Number" class="mono"><?php echo htmlspecialchars($student['student_number']); ?></td>
+                            <td data-label="Full Name">
                                 <strong><?php echo htmlspecialchars($student['full_name']); ?></strong>
-                            </td
-                            <td><?php echo htmlspecialchars($student['course']); ?></td
-                            <td><?php echo $student['year_level']; ?></td
-                            <td class="mono"><?php echo $student['time_in'] ? date('g:i A', strtotime($student['time_in'])) : '—'; ?></td>
-                            <td class="mono"><?php echo $student['time_out'] ? date('g:i A', strtotime($student['time_out'])) : '—'; ?></td>
-                            <td>
-                                <span class="badge <?php echo $statusClass; ?>"><?php echo $statusText; ?></span>
-                            </td
-                            <td>
+                            </td>
+                            <td data-label="Course"><?php echo htmlspecialchars($student['course']); ?></td>
+                            <td data-label="Year Level"><?php echo $student['year_level']; ?></td>
+                            <td data-label="Time In" class="mono"><?php echo $student['time_in'] ? date('g:i A', strtotime($student['time_in'])) : '—'; ?></td>
+                            <td data-label="Time Out" class="mono"><?php echo $student['time_out'] ? date('g:i A', strtotime($student['time_out'])) : '—'; ?></td>
+                            <td data-label="Status">
+                                <span class="badge <?php echo statusBadgeClass($student['status'] ?? ''); ?>"><?php echo htmlspecialchars($statusText); ?></span>
+                            </td>
+                            <td data-label="Action">
                                 <a href="student-record.php?id=<?php echo $student['id']; ?>" class="btn btn-sm btn-primary">View Record</a>
-                            </td
+                            </td>
                         </tr>
                         <?php endforeach; ?>
                     </tbody>
@@ -259,11 +312,42 @@ include 'layout.php';
             </div>
             <?php endif; ?>
         </div>
+        <?php else: ?>
+            <div class="card">
+                <div class="empty-state">
+                    <div class="empty-icon">📖</div>
+                    <h4>No class selected</h4>
+                    <p>Please select a subject from the left sidebar.</p>
+                </div>
+            </div>
         <?php endif; ?>
     </div>
 </div>
 
 <style>
+/* Layout */
+.two-column-layout {
+    display: flex;
+    gap: 24px;
+    flex-wrap: wrap;
+}
+.subject-sidebar {
+    width: 300px;
+    flex-shrink: 0;
+}
+.student-content {
+    flex: 1;
+    min-width: 0;
+}
+.info-grid {
+    display: flex;
+    gap: 30px;
+    flex-wrap: wrap;
+}
+.info-grid > div {
+    flex: 1 1 auto;
+}
+/* Subject list */
 .subject-list {
     display: flex;
     flex-direction: column;
@@ -300,25 +384,70 @@ include 'layout.php';
     font-size: 10px;
     color: var(--accent);
 }
+/* Badges */
+.badge {
+    display: inline-block;
+    padding: 4px 10px;
+    border-radius: 20px;
+    font-size: 12px;
+    font-weight: 500;
+}
+.badge-present {
+    background: #d4edda;
+    color: #155724;
+}
+.badge-late {
+    background: #fff3cd;
+    color: #856404;
+}
+.badge-absent {
+    background: #f8d7da;
+    color: #721c24;
+}
+.badge-default {
+    background: #e2e3e5;
+    color: #383d41;
+}
+/* Tables */
+.table-wrap {
+    overflow-x: auto;
+}
+.student-table, .attendance-table {
+    width: 100%;
+    border-collapse: collapse;
+}
+.student-table th, .student-table td,
+.attendance-table th, .attendance-table td {
+    padding: 10px 12px;
+    border-bottom: 1px solid var(--border);
+    text-align: left;
+    vertical-align: middle;
+}
+.student-table th, .attendance-table th {
+    background: var(--dark);
+    color: white;
+    font-weight: 600;
+}
+.mono {
+    font-family: 'Courier New', monospace;
+    font-size: 0.9em;
+}
 .student-count {
     background: var(--accent-subtle);
     padding: 6px 12px;
     border-radius: 20px;
     font-size: 13px;
 }
-.student-table th,
-.student-table td,
-.attendance-table th,
-.attendance-table td {
-    padding: 10px 12px;
-    border-bottom: 1px solid var(--border);
-    text-align: left;
-    vertical-align: middle;
+.btn {
+    display: inline-block;
+    padding: 6px 12px;
+    border-radius: 4px;
+    text-decoration: none;
+    font-size: 12px;
+    transition: 0.2s;
 }
-.student-table th,
-.attendance-table th {
-    background: var(--dark);
-    color: white;
+.btn-sm {
+    padding: 4px 8px;
 }
 .btn-primary {
     background: var(--accent);
@@ -331,6 +460,62 @@ include 'layout.php';
     background: var(--bg-subtle);
     color: var(--slate);
     border: 1px solid var(--border);
+}
+.empty-state {
+    text-align: center;
+    padding: 60px 20px;
+}
+.empty-icon {
+    font-size: 64px;
+    margin-bottom: 20px;
+    opacity: 0.6;
+}
+.empty-state h4 {
+    margin-bottom: 10px;
+    color: var(--dark);
+}
+.empty-state p {
+    color: var(--muted);
+}
+/* Responsive */
+@media (max-width: 768px) {
+    .two-column-layout {
+        flex-direction: column;
+    }
+    .subject-sidebar {
+        width: 100%;
+    }
+    .info-grid {
+        flex-direction: column;
+        gap: 15px;
+    }
+}
+@media (max-width: 640px) {
+    .student-table thead, .attendance-table thead {
+        display: none;
+    }
+    .student-table tbody tr, .attendance-table tbody tr {
+        display: block;
+        margin-bottom: 1rem;
+        border: 1px solid var(--border);
+        border-radius: 8px;
+    }
+    .student-table td, .attendance-table td {
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        padding: 10px;
+        border-bottom: 1px solid var(--border);
+    }
+    .student-table td::before, .attendance-table td::before {
+        content: attr(data-label);
+        font-weight: bold;
+        width: 40%;
+        color: var(--dark);
+    }
+    .student-table td:last-child, .attendance-table td:last-child {
+        border-bottom: none;
+    }
 }
 </style>
 

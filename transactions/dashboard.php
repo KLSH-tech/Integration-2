@@ -14,11 +14,30 @@ $today    = date('Y-m-d');
 
 // ── Key metrics ───────────────────────────────────────────────────────────────
 $totalStudents  = (int) $pdo->query("SELECT COUNT(*) FROM students")->fetchColumn();
-$markedToday    = (int) $pdo->query("SELECT COUNT(*) FROM attendance WHERE date = CURDATE()")->fetchColumn();
-$presentToday   = (int) $pdo->query("SELECT COUNT(*) FROM attendance WHERE date = CURDATE() AND status = 'Present'")->fetchColumn();
-$lateToday      = (int) $pdo->query("SELECT COUNT(*) FROM attendance WHERE date = CURDATE() AND status = 'Late'")->fetchColumn();
-$absentToday    = (int) $pdo->query("SELECT COUNT(*) FROM attendance WHERE date = CURDATE() AND status = 'Absent'")->fetchColumn();
-$notMarked      = $totalStudents - $markedToday;
+
+// Today's Present / Late counts come from the SCAN LOGS (attendance_logs) — the
+// same table the barcode scanner writes to — so these cards reflect real scans.
+// Per student per day: late if ANY of today's time-in scans was late, else present.
+$todayCounts = $pdo->query("
+    SELECT
+        COALESCE(SUM(day_status = 'present'), 0) AS present,
+        COALESCE(SUM(day_status = 'late'),    0) AS late
+    FROM (
+        SELECT student_id,
+               CASE WHEN MAX(attendance_status = 'late') = 1
+                    THEN 'late' ELSE 'present' END AS day_status
+        FROM attendance_logs
+        WHERE action = 'in'
+          AND DATE(logged_at) = CURDATE()
+        GROUP BY student_id
+    ) AS day
+")->fetch();
+
+$presentToday = (int) ($todayCounts['present'] ?? 0);
+$lateToday    = (int) ($todayCounts['late'] ?? 0);
+$absentToday  = 0;                                  // scans never record a plain "Absent"
+$markedToday  = $presentToday + $lateToday;         // distinct students seen today
+$notMarked    = max(0, $totalStudents - $markedToday);
 $pendingDisputes = pendingDisputeCount();
 
 $totalRecords  = (int) $pdo->query("SELECT COUNT(*) FROM attendance")->fetchColumn();
@@ -81,25 +100,25 @@ include 'layout.php';
 <div class="stats-row">
     <div class="stat-card c-blue">
         <span class="stat-icon-display">👥</span>
-        <div class="stat-num"><?php echo $totalStudents; ?></div>
+        <div class="stat-num" id="totalStudents"><?php echo $totalStudents; ?></div>
         <div class="stat-label">Total Students</div>
-        <div class="stat-trend"><?php echo $markedToday; ?> checked in today</div>
+        <div class="stat-trend" id="markedToday"><?php echo $markedToday; ?> checked in today</div>
     </div>
     <div class="stat-card c-green">
         <span class="stat-icon-display">✅</span>
-        <div class="stat-num"><?php echo $presentToday; ?></div>
+        <div class="stat-num" id="presentCount"><?php echo $presentToday; ?></div>
         <div class="stat-label">Present Today</div>
-        <div class="stat-trend" style="color:var(--success);">+<?php echo $lateToday; ?> Late</div>
+        <div class="stat-trend" style="color:var(--success);" id="lateCount">+<?php echo $lateToday; ?> Late</div>
     </div>
     <div class="stat-card c-red">
         <span class="stat-icon-display">❌</span>
-        <div class="stat-num"><?php echo $absentToday + $notMarked; ?></div>
+        <div class="stat-num" id="absentTotal"><?php echo $absentToday + $notMarked; ?></div>
         <div class="stat-label">Absent / Not Marked</div>
-        <div class="stat-trend"><?php echo $absentToday; ?> absent, <?php echo $notMarked; ?> no record</div>
+        <div class="stat-trend" id="absentDetail"><?php echo $absentToday; ?> absent, <?php echo $notMarked; ?> no record</div>
     </div>
     <div class="stat-card <?php echo $pendingDisputes ? 'c-amber' : 'c-purple'; ?>">
         <span class="stat-icon-display">📋</span>
-        <div class="stat-num"><?php echo $pendingDisputes; ?></div>
+        <div class="stat-num" id="disputeCount"><?php echo $pendingDisputes; ?></div>
         <div class="stat-label">Pending Disputes</div>
         <div class="stat-trend"><?php echo $pendingDisputes ? 'Requires your review' : 'All clear'; ?></div>
     </div>
